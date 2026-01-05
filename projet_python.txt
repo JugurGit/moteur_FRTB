@@ -1,0 +1,3450 @@
+### FILE: app.py
+# app.py
+from __future__ import annotations
+
+import streamlit as st
+
+from ui_common import apply_page_config, apply_pro_css, init_session_state, summary_kpis
+
+apply_page_config()
+apply_pro_css()
+init_session_state()
+
+st.title("FRTB SA / SBM — Mini Dashboard")
+st.caption("Interface Streamlit pour piloter le portfolio, le marché, les configs et lancer le moteur de calcul.")
+
+col1, col2, col3, col4 = st.columns(4)
+k = summary_kpis()
+col1.metric("Equity trades", k["n_eq"])
+col2.metric("GIRR swaps", k["n_sw"])
+col3.metric("GIRR bonds", k["n_bo"])
+col4.metric("Dernier run", k["last_run_status"])
+
+st.divider()
+st.markdown(
+    """
+### Navigation
+Utilise les pages à gauche :
+- **Overview** : résumé + état courant
+- **Portfolio** : upload / édition interactive
+- **Market** : courbes + FX
+- **Configs** : paramètres Equity / GIRR
+- **Run & Results** : exécution + résultats + logs
+- **Export** : téléchargement des outputs
+
+> Astuce : le moteur original `FRTBEngine.run()` imprime beaucoup — on capture ces logs et on les affiche.
+"""
+)
+
+if st.session_state.get("last_logs"):
+    with st.expander("Afficher les logs du dernier run", expanded=False):
+        st.code(st.session_state["last_logs"], language="text")
+
+
+### FILE: curves.py
+# frtb/curves.py
+from __future__ import annotations
+
+import bisect
+import math
+from dataclasses import dataclass
+from typing import Tuple
+
+
+def lin_interp(x: float, x0: float, y0: float, x1: float, y1: float) -> float:
+    if abs(x1 - x0) < 1e-15:
+        return y0
+    w = (x - x0) / (x1 - x0)
+    return y0 + w * (y1 - y0)
+
+
+@dataclass(frozen=True)
+class ZeroCurve:
+    tenors: Tuple[float, ...]
+    zeros: Tuple[float, ...]
+
+    def z(self, t: float) -> float:
+        T = self.tenors
+        Z = self.zeros
+
+        if t <= T[0]:
+            return Z[0]
+        if t >= T[-1]:
+            return Z[-1]
+
+        j = bisect.bisect_left(T, t)
+        if abs(T[j] - t) < 1e-15:
+            return Z[j]
+        i = j - 1
+        return lin_interp(t, T[i], Z[i], T[j], Z[j])
+
+    def df(self, t: float) -> float:
+        return math.exp(-self.z(t) * t)
+
+    def bumped(self, bump_t: float, bump_size: float = 1e-4) -> "ZeroCurve":
+        idx = None
+        for k, T in enumerate(self.tenors):
+            if abs(T - bump_t) < 1e-12:
+                idx = k
+                break
+        if idx is None:
+            raise ValueError(f"bump_t={bump_t} is not an exact curve node")
+        z = list(self.zeros)
+        z[idx] += bump_size
+        return ZeroCurve(self.tenors, tuple(z))
+
+
+### FILE: demo.py
+# frtb/demo.py
+from __future__ import annotations
+
+from typing import Tuple
+
+from curves import ZeroCurve
+from market import Market
+from portfolio import BondTrade, EquityCallTrade, Portfolio, SwapTrade
+from equity import EquityConfig
+from girr import GirrConfig
+
+
+def demo_market() -> Tuple[Market, Tuple[Tuple[float, ...], Tuple[float, ...], Tuple[float, ...]]]:
+    tenors = (0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0, 15.0, 20.0, 30.0)
+
+    z_eur_swap = (0.0320, 0.0300, 0.0270, 0.0240, 0.0230, 0.0240, 0.0260, 0.0270, 0.0280, 0.0290)
+    z_usd_swap = (0.0520, 0.0500, 0.0470, 0.0440, 0.0420, 0.0410, 0.0420, 0.0430, 0.0440, 0.0450)
+
+    z_eur_bond_map = {0.25: 0.0270, 0.5: 0.0260, 1.0: 0.0245, 2.0: 0.0235, 3.0: 0.0230, 5.0: 0.0235, 10.0: 0.0255, 15.0: 0.0265, 20.0: 0.0260, 30.0: 0.0250}
+    z_usd_bond_map = {0.25: 0.0530, 0.5: 0.0520, 1.0: 0.0500, 2.0: 0.0460, 3.0: 0.0430, 5.0: 0.0410, 10.0: 0.0420, 15.0: 0.0430, 20.0: 0.0435, 30.0: 0.0440}
+    z_eur_bond = tuple(z_eur_bond_map[T] for T in tenors)
+    z_usd_bond = tuple(z_usd_bond_map[T] for T in tenors)
+
+    curves = {
+        "EUR": ZeroCurve(tenors, z_eur_swap),
+        "USD": ZeroCurve(tenors, z_usd_swap),
+    }
+    fx = {("USD", "EUR"): 0.92, ("EUR", "USD"): 1.0 / 0.92}
+    return Market(reporting_ccy="EUR", fx=fx, curves=curves), (tenors, z_eur_bond, z_usd_bond)
+
+
+def demo_equity_config() -> EquityConfig:
+    delta_rw = {
+        7: {"spot": 0.40, "repo": 0.0040, "curv": 0.40},
+        8: {"spot": 0.50, "repo": 0.0050, "curv": 0.50},
+    }
+    return EquityConfig(
+        delta_rw=delta_rw,
+        rho_spot_repo_med=0.999,
+        gamma_inter_bucket_med=0.15,
+        rw_vega=0.7778,
+    )
+
+
+def demo_girr_cfg_swaps() -> GirrConfig:
+    rw = {0.25: 0.017, 0.5: 0.017, 1.0: 0.016, 2.0: 0.013, 3.0: 0.012, 5.0: 0.011, 10.0: 0.011, 15.0: 0.011, 20.0: 0.011, 30.0: 0.011}
+    return GirrConfig(
+        rw_by_tenor=rw,
+        specified_currency_reduction=True,
+        bump_bp=1e-4,
+        gamma_inter_ccy_med=0.50,
+        scenario_rule="lowmedhigh",
+        rho_rule="exp_absdiff",
+        rho_param=0.018,
+    )
+
+
+def demo_girr_cfg_bonds() -> GirrConfig:
+    rw_list = [0.017, 0.017, 0.015, 0.014, 0.014, 0.015, 0.015, 0.016, 0.016, 0.016]
+    ten = [0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0, 15.0, 20.0, 30.0]
+    rw = {ten[i]: rw_list[i] for i in range(len(ten))}
+    return GirrConfig(
+        rw_by_tenor=rw,
+        specified_currency_reduction=False,
+        bump_bp=1e-4,
+        gamma_inter_ccy_med=0.50,
+        scenario_rule="basel_scale",
+        rho_rule="basel_tenor",
+        rho_param=0.03,
+    )
+
+
+def demo_portfolio() -> Portfolio:
+    eq = [
+        EquityCallTrade(
+            name="Trade A (Short Call) – Bucket 8",
+            bucket=8, N=-10_000, S0=100.0, K=100.0, T=1.0, r=0.02, q_repo=0.01, sigma=0.25
+        ),
+        EquityCallTrade(
+            name="Trade B (Short Call) – Bucket 7",
+            bucket=7, N=-20_000, S0=50.0, K=55.0, T=0.5, r=0.02, q_repo=0.005, sigma=0.30
+        ),
+    ]
+    sw = [
+        SwapTrade(name="EUR IRS 5Y (Rec-Fixed)", ccy="EUR", notional=100_000_000.0, maturity=5, receive_fixed=True),
+        SwapTrade(name="USD IRS 3Y (Pay-Fixed)", ccy="USD", notional=100_000_000.0, maturity=3, receive_fixed=False),
+    ]
+    bo = [
+        BondTrade(name="EUR 3Y bond", ccy="EUR", notional=100_000_000.0, coupon_rate=0.03, maturity=3),
+        BondTrade(name="USD 5Y bond", ccy="USD", notional=100_000_000.0, coupon_rate=0.045, maturity=5),
+    ]
+    return Portfolio(eq, sw, bo)
+
+
+### FILE: engine.py
+# frtb/engine.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple
+
+from curves import ZeroCurve
+from market import Market
+from portfolio import Portfolio
+from equity import EquityConfig, equity_sbm
+from girr import GirrConfig, girr_delta_sbm, sensitivities_bonds, sensitivities_swaps
+from utils import fmt_money
+
+
+@dataclass
+class FRTBEngine:
+    market: Market
+    equity_cfg: EquityConfig
+    girr_cfg_swaps: GirrConfig
+    girr_cfg_bonds: GirrConfig
+
+    def run(
+        self,
+        port: Portfolio,
+        bond_curves_override: Optional[Tuple[Tuple[float, ...], Tuple[float, ...], Tuple[float, ...]]] = None,
+        verbose: bool = True
+    ) -> Dict[str, Any]:
+        # 1) Equity
+        res_eq = equity_sbm(port.equity_calls, self.equity_cfg, verbose=verbose)
+
+        # 2) GIRR swaps
+        if port.girr_swaps:
+            if verbose:
+                print("\n" + "=" * 90)
+                print("GIRR — Swaps — Delta (SBM)")
+                print("=" * 90)
+                print("[0] Bump&reprice sensitivities s_k sur z(Tk)")
+            sens_sw = sensitivities_swaps(port.girr_swaps, self.market, self.girr_cfg_swaps, verbose=verbose)
+            res_sw = girr_delta_sbm(sens_sw, self.girr_cfg_swaps, verbose=verbose)
+        else:
+            res_sw = {"K_final": 0.0}
+
+        # 3) GIRR bonds (avec override curves éventuel)
+        if port.girr_bonds:
+            if verbose:
+                print("\n" + "=" * 90)
+                print("GIRR — Bonds — Delta (SBM)")
+                print("=" * 90)
+                print("[0] Bump&reprice sensitivities s_k sur z(Tk)")
+
+            if bond_curves_override is not None:
+                tenors, z_eur_bond, z_usd_bond = bond_curves_override
+                old_eur = self.market.curves["EUR"]
+                old_usd = self.market.curves["USD"]
+                try:
+                    self.market.curves["EUR"] = ZeroCurve(tenors, z_eur_bond)
+                    self.market.curves["USD"] = ZeroCurve(tenors, z_usd_bond)
+                    sens_bo = sensitivities_bonds(port.girr_bonds, self.market, self.girr_cfg_bonds, verbose=verbose)
+                    res_bo = girr_delta_sbm(sens_bo, self.girr_cfg_bonds, verbose=verbose)
+                finally:
+                    self.market.curves["EUR"] = old_eur
+                    self.market.curves["USD"] = old_usd
+            else:
+                sens_bo = sensitivities_bonds(port.girr_bonds, self.market, self.girr_cfg_bonds, verbose=verbose)
+                res_bo = girr_delta_sbm(sens_bo, self.girr_cfg_bonds, verbose=verbose)
+        else:
+            res_bo = {"K_final": 0.0}
+
+        # Résumé (somme simple)
+        if verbose:
+            print("\n" + "=" * 90)
+            print("RÉSUMÉ (par risk class) — et somme simple")
+            print("=" * 90)
+            K_eq = float(res_eq["K_final"])
+            K_sw = float(res_sw["K_final"])
+            K_bo = float(res_bo["K_final"])
+            print(f"  Equity     : {fmt_money(K_eq)}")
+            print(f"  GIRR Swaps : {fmt_money(K_sw)}")
+            print(f"  GIRR Bonds : {fmt_money(K_bo)}")
+            print(f"\n  Total (somme) : {fmt_money(K_eq + K_sw + K_bo)}")
+            print("=" * 90)
+
+        return {"equity": res_eq, "girr_swaps": res_sw, "girr_bonds": res_bo}
+
+
+### FILE: equity.py
+# frtb/equity.py
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Any, Dict, List
+
+from portfolio import EquityCallTrade
+from utils import SCENARIOS, fmt_money, inter_bucket, low_med_high
+
+
+def norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def norm_pdf(x: float) -> float:
+    return (1.0 / math.sqrt(2.0 * math.pi)) * math.exp(-0.5 * x * x)
+
+
+def bs_call_price_delta_vega(S: float, K: float, T: float, r: float, q: float, sigma: float):
+    if T <= 0.0:
+        raise ValueError("T doit être > 0")
+    if sigma <= 0.0:
+        raise ValueError("sigma doit être > 0")
+
+    sqrtT = math.sqrt(T)
+    d1 = (math.log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * sqrtT)
+    d2 = d1 - sigma * sqrtT
+
+    df_r = math.exp(-r * T)
+    df_q = math.exp(-q * T)
+
+    price = S * df_q * norm_cdf(d1) - K * df_r * norm_cdf(d2)
+    delta = df_q * norm_cdf(d1)
+    vega = S * df_q * sqrtT * norm_pdf(d1)
+
+    return price, delta, vega, d1, d2
+
+
+@dataclass(frozen=True)
+class EquityConfig:
+    delta_rw: Dict[int, Dict[str, float]]   # {bucket: {"spot":..., "repo":..., "curv":...}}
+    rho_spot_repo_med: float
+    gamma_inter_bucket_med: float
+    rw_vega: float
+
+
+def equity_sbm(trades: List[EquityCallTrade], cfg: EquityConfig, verbose: bool = True) -> Dict[str, Any]:
+    if not trades:
+        return {"K_final": 0.0, "details": {}}
+
+    if verbose:
+        print("\n" + "=" * 90)
+        print("EQUITY — FRTB SA / SBM (Delta + Vega + Curvature)")
+        print("=" * 90)
+
+    # ---- 1) Metrics par trade
+    tmet: Dict[str, Dict[str, float]] = {}
+    if verbose:
+        print("\n[1] Pricing + Greeks")
+
+    for t in trades:
+        price, delta, vega, d1, d2 = bs_call_price_delta_vega(t.S0, t.K, t.T, t.r, t.q_repo, t.sigma)
+        PV = t.N * price
+
+        s_spot = t.N * t.S0 * delta
+        s_repo = t.N * (-t.T * t.S0 * delta)
+        VR = t.N * vega * t.sigma
+
+        tmet[t.name] = {"bucket": float(t.bucket), "PV": PV, "s_spot": s_spot, "s_repo": s_repo, "VR": VR}
+
+        if verbose:
+            print(f"\n  - {t.name}")
+            print(f"    d1={d1:.6f} | d2={d2:.6f} | PV={fmt_money(PV)}")
+            print(f"    s_spot={fmt_money(s_spot)} | s_repo={fmt_money(s_repo)} | VR={fmt_money(VR)}")
+
+    buckets = sorted({int(x["bucket"]) for x in tmet.values()})
+
+    # ---- 2) Delta
+    if verbose:
+        print("\n" + "-" * 90)
+        print("[2] DELTA (SBM)")
+        print("-" * 90)
+
+    rho_sr = low_med_high(cfg.rho_spot_repo_med)
+    gamma_ib = low_med_high(cfg.gamma_inter_bucket_med)
+
+    bucket_delta: Dict[int, Dict[str, float]] = {}
+    for b in buckets:
+        s_spot_b = sum(m["s_spot"] for m in tmet.values() if int(m["bucket"]) == b)
+        s_repo_b = sum(m["s_repo"] for m in tmet.values() if int(m["bucket"]) == b)
+
+        rw_spot = cfg.delta_rw[b]["spot"]
+        rw_repo = cfg.delta_rw[b]["repo"]
+
+        WS_spot = rw_spot * s_spot_b
+        WS_repo = rw_repo * s_repo_b
+
+        Kb = {}
+        for sc in SCENARIOS:
+            rho = rho_sr[sc]
+            Kb[sc] = math.sqrt(max(WS_spot * WS_spot + WS_repo * WS_repo + 2.0 * rho * WS_spot * WS_repo, 0.0))
+
+        S_b = WS_spot + WS_repo
+        bucket_delta[b] = {
+            "WS_spot": WS_spot, "WS_repo": WS_repo, "S": S_b,
+            "K_low": Kb["low"], "K_med": Kb["medium"], "K_high": Kb["high"],
+        }
+
+        if verbose:
+            print(f"\n  Bucket {b}:")
+            print(f"    WS_spot={fmt_money(WS_spot)} | WS_repo={fmt_money(WS_repo)} | S_b={fmt_money(S_b)}")
+            print(f"    K_b low/med/high = {fmt_money(Kb['low'])} / {fmt_money(Kb['medium'])} / {fmt_money(Kb['high'])}")
+
+    Kd = {}
+    X = {b: bucket_delta[b]["S"] for b in buckets}
+    for sc in SCENARIOS:
+        key = {"low": "K_low", "medium": "K_med", "high": "K_high"}[sc]
+        Kb_sc = {b: bucket_delta[b][key] for b in buckets}
+        Kd[sc] = inter_bucket(Kb_sc, X, gamma_ib[sc])
+
+    if verbose:
+        print("\n  Inter-bucket DELTA:")
+        print(f"    gamma low/med/high = {gamma_ib['low']:.6f} / {gamma_ib['medium']:.6f} / {gamma_ib['high']:.6f}")
+        print(f"    KΔ low/med/high = {fmt_money(Kd['low'])} / {fmt_money(Kd['medium'])} / {fmt_money(Kd['high'])}")
+
+    # ---- 3) Vega
+    if verbose:
+        print("\n" + "-" * 90)
+        print("[3] VEGA (SBM)")
+        print("-" * 90)
+
+    bucket_vega: Dict[int, Dict[str, float]] = {}
+    for b in buckets:
+        VR_b = sum(m["VR"] for m in tmet.values() if int(m["bucket"]) == b)
+        WS_b = cfg.rw_vega * VR_b
+        K_b = abs(WS_b)
+        bucket_vega[b] = {"S": WS_b, "K": K_b}
+
+        if verbose:
+            print(f"\n  Bucket {b}: VR_b={fmt_money(VR_b)} | WS_b={fmt_money(WS_b)} | K_b={fmt_money(K_b)}")
+
+    Kv = {}
+    Xv = {b: bucket_vega[b]["S"] for b in buckets}
+    for sc in SCENARIOS:
+        Kb_sc = {b: bucket_vega[b]["K"] for b in buckets}
+        Kv[sc] = inter_bucket(Kb_sc, Xv, gamma_ib[sc])
+
+    if verbose:
+        print("\n  Inter-bucket VEGA:")
+        print(f"    Kν low/med/high = {fmt_money(Kv['low'])} / {fmt_money(Kv['medium'])} / {fmt_money(Kv['high'])}")
+
+    # ---- 4) Curvature
+    if verbose:
+        print("\n" + "-" * 90)
+        print("[4] CURVATURE (SBM)")
+        print("-" * 90)
+
+    gammaC = low_med_high(cfg.gamma_inter_bucket_med ** 2)
+    bucket_curv = {b: 0.0 for b in buckets}
+
+    for t in trades:
+        b = t.bucket
+        rwc = cfg.delta_rw[b]["curv"]
+
+        price0, delta0, _, _, _ = bs_call_price_delta_vega(t.S0, t.K, t.T, t.r, t.q_repo, t.sigma)
+        V0 = t.N * price0
+        s_spot = t.N * t.S0 * delta0
+
+        V_plus = t.N * bs_call_price_delta_vega(t.S0 * (1.0 + rwc), t.K, t.T, t.r, t.q_repo, t.sigma)[0]
+        V_minus = t.N * bs_call_price_delta_vega(t.S0 * (1.0 - rwc), t.K, t.T, t.r, t.q_repo, t.sigma)[0]
+
+        CVR_plus = -(V_plus - V0 - rwc * s_spot)
+        CVR_minus = -(V_minus - V0 + rwc * s_spot)
+
+        bucket_curv[b] = max(bucket_curv[b], max(CVR_plus, 0.0), max(CVR_minus, 0.0))
+
+        if verbose:
+            print(f"\n  {t.name}")
+            print(f"    RW^C={rwc:.2f} | V0={fmt_money(V0)} | V+={fmt_money(V_plus)} | V-={fmt_money(V_minus)}")
+            print(f"    s_spot={fmt_money(s_spot)} | CVR+={fmt_money(CVR_plus)} | CVR-={fmt_money(CVR_minus)}")
+            print(f"    -> K_bucket_curv now = {fmt_money(bucket_curv[b])}")
+
+    if verbose:
+        print("\n  Curvature par bucket:")
+        for b in buckets:
+            print(f"    Bucket {b}: K_b^curv={fmt_money(bucket_curv[b])}")
+
+    Kc = {}
+    Xc = dict(bucket_curv)  # comme ton code: X = K_b^curv
+    for sc in SCENARIOS:
+        Kb_sc = dict(bucket_curv)
+        Kc[sc] = inter_bucket(Kb_sc, Xc, gammaC[sc])
+
+    if verbose:
+        print("\n  Inter-bucket CURVATURE:")
+        print(f"    gamma^C low/med/high = {gammaC['low']:.6f} / {gammaC['medium']:.6f} / {gammaC['high']:.6f}")
+        print(f"    Kcurv low/med/high = {fmt_money(Kc['low'])} / {fmt_money(Kc['medium'])} / {fmt_money(Kc['high'])}")
+
+    totals = {sc: Kd[sc] + Kv[sc] + Kc[sc] for sc in SCENARIOS}
+    K_final = max(totals.values())
+    worst = max(totals, key=lambda k: totals[k])
+
+    if verbose:
+        print("\n" + "=" * 90)
+        print("[5] Capital Equity final = max(low, medium, high)")
+        print("=" * 90)
+        print(f"  Low   : {fmt_money(totals['low'])}")
+        print(f"  Medium: {fmt_money(totals['medium'])}")
+        print(f"  High  : {fmt_money(totals['high'])}")
+        print(f"\n  >>> Equity capital final = {fmt_money(K_final)} (worst={worst.upper()})")
+
+    return {
+        "K_final": K_final,
+        "totals": totals,
+        "bucket_delta": bucket_delta,
+        "bucket_vega": bucket_vega,
+        "bucket_curv": bucket_curv,
+    }
+
+
+### FILE: export_projet.py
+import os
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+OUTPUT = os.path.join(ROOT, "projet_python.txt")
+
+EXCLUDE_DIRS = {".git", "venv", "__pycache__"}
+
+with open(OUTPUT, "w", encoding="utf-8") as out:
+    for dirpath, dirnames, filenames in os.walk(ROOT):
+        # enlever les dossiers à exclure
+        dirnames[:] = [d for d in dirnames if d not in EXCLUDE_DIRS]
+
+        for filename in filenames:
+            if not filename.endswith((".py", ".ipynb")):
+                continue
+
+            full_path = os.path.join(dirpath, filename)
+            rel_path = os.path.relpath(full_path, ROOT)
+
+            out.write(f"### FILE: {rel_path}\n")
+            try:
+                with open(full_path, "r", encoding="utf-8") as f:
+                    out.write(f.read())
+            except UnicodeDecodeError:
+                out.write("[UNICODE ERROR: impossible de lire ce fichier]\n")
+
+            out.write("\n\n")
+
+print(f"Export terminé dans {OUTPUT}")
+
+
+### FILE: girr.py
+# frtb/girr.py
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from curves import ZeroCurve
+from market import Market
+from portfolio import BondTrade, SwapTrade
+from utils import SCENARIOS, clip_corr, basel_scale, fmt_int, fmt_num, inter_bucket, low_med_high
+
+
+# --- swap pricing (identique logique swap.py)
+def swap_annuity(curve: ZeroCurve, T: int) -> float:
+    return sum(curve.df(i) for i in range(1, T + 1))
+
+
+def par_swap_rate(curve: ZeroCurve, T: int) -> float:
+    A = swap_annuity(curve, T)
+    return (1.0 - curve.df(T)) / A
+
+
+def pv_swap(curve: ZeroCurve, N: float, T: int, K: float, receive_fixed: bool) -> float:
+    A = swap_annuity(curve, T)
+    S = par_swap_rate(curve, T)
+    return N * (K - S) * A if receive_fixed else N * (S - K) * A
+
+
+# --- bond pricing (identique logique bond.py)
+def bond_cashflows(notional: float, coupon_rate: float, maturity: int) -> List[Tuple[float, float]]:
+    cpn = notional * coupon_rate
+    out = []
+    for yr in range(1, maturity + 1):
+        if yr < maturity:
+            out.append((float(yr), cpn))
+        else:
+            out.append((float(yr), cpn + notional))
+    return out
+
+
+def pv_bond(curve: ZeroCurve, notional: float, coupon_rate: float, maturity: int) -> float:
+    total = 0.0
+    for t, cf in bond_cashflows(notional, coupon_rate, maturity):
+        total += cf * curve.df(t)
+    return total
+
+
+@dataclass(frozen=True)
+class GirrConfig:
+    rw_by_tenor: Dict[float, float]
+    specified_currency_reduction: bool
+    bump_bp: float
+    gamma_inter_ccy_med: float
+    scenario_rule: str   # "lowmedhigh" or "basel_scale"
+    rho_rule: str        # "exp_absdiff" or "basel_tenor"
+    rho_param: float     # a (exp_absdiff) OR theta (basel_tenor)
+
+
+def scenario_gamma(cfg: GirrConfig, scenario: str) -> float:
+    if cfg.scenario_rule == "lowmedhigh":
+        return low_med_high(cfg.gamma_inter_ccy_med)[scenario]
+    if cfg.scenario_rule == "basel_scale":
+        return clip_corr(basel_scale(cfg.gamma_inter_ccy_med, scenario))
+    raise ValueError("scenario_rule must be lowmedhigh or basel_scale")
+
+
+def rho_tenor_basel(Tk: float, Tl: float, theta: float) -> float:
+    if Tk <= 0.0 or Tl <= 0.0:
+        return 0.4
+    return max(math.exp(-theta * abs(math.log(Tk / Tl))), 0.4)
+
+
+def scenario_adjust_corr(cfg: GirrConfig, scenario: str, base_corr: float) -> float:
+    if cfg.scenario_rule == "lowmedhigh":
+        return clip_corr(low_med_high(base_corr)[scenario])
+    if cfg.scenario_rule == "basel_scale":
+        return clip_corr(basel_scale(base_corr, scenario))
+    raise ValueError("scenario_rule must be lowmedhigh or basel_scale")
+
+
+def corr_matrix_for_tenors(tenors: List[float], cfg: GirrConfig, scenario: str) -> List[List[float]]:
+    n = len(tenors)
+    out = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                base = 1.0
+            else:
+                if cfg.rho_rule == "exp_absdiff":
+                    base = math.exp(-cfg.rho_param * abs(tenors[i] - tenors[j]))
+                elif cfg.rho_rule == "basel_tenor":
+                    base = rho_tenor_basel(tenors[i], tenors[j], theta=cfg.rho_param)
+                else:
+                    raise ValueError("rho_rule must be exp_absdiff or basel_tenor")
+
+            out[i][j] = scenario_adjust_corr(cfg, scenario, base)
+    return out
+
+
+# ---- bump&reprice générique (swaps + bonds)
+
+PrepareCtx = Callable[[Any, ZeroCurve], Any]
+PVWithCtx = Callable[[Any, ZeroCurve, Any], float]
+CCYFunc = Callable[[Any], str]
+TradePrinter = Callable[[Any, float], None]
+
+
+def bump_and_reprice_sens(
+    trades: List[Any],
+    mkt: Market,
+    cfg: GirrConfig,
+    prepare_ctx: PrepareCtx,
+    pv_with_ctx: PVWithCtx,
+    ccy_func: CCYFunc,
+    printer: Optional[TradePrinter],
+    verbose: bool,
+) -> Dict[str, Dict[float, float]]:
+    tenors_nodes = sorted(cfg.rw_by_tenor.keys())
+    out: Dict[str, Dict[float, float]] = {}
+
+    for tr in trades:
+        ccy = ccy_func(tr)
+        curve0 = mkt.curves[ccy]
+        ctx = prepare_ctx(tr, curve0)
+        PV0 = pv_with_ctx(tr, curve0, ctx)
+
+        sens_ccy = {T: 0.0 for T in tenors_nodes}
+        for Tk in tenors_nodes:
+            PVb = pv_with_ctx(tr, curve0.bumped(Tk, cfg.bump_bp), ctx)
+            s = (PVb - PV0) / cfg.bump_bp
+            sens_ccy[Tk] += mkt.convert(s, ccy, mkt.reporting_ccy)
+
+        out.setdefault(ccy, {T: 0.0 for T in tenors_nodes})
+        for T in tenors_nodes:
+            out[ccy][T] += sens_ccy[T]
+
+        if verbose and printer is not None:
+            printer(tr, mkt.convert(PV0, ccy, mkt.reporting_ccy))
+
+    return out
+
+
+# ---- delta SBM
+
+def girr_delta_sbm(bucket_sens: Dict[str, Dict[float, float]], cfg: GirrConfig, verbose: bool) -> Dict[str, Any]:
+    if not bucket_sens:
+        return {"K_final": 0.0, "details": {}}
+
+    tenors_nodes = sorted(cfg.rw_by_tenor.keys())
+
+    rw = dict(cfg.rw_by_tenor)
+    if cfg.specified_currency_reduction:
+        for T in rw:
+            rw[T] /= math.sqrt(2.0)
+
+    WS: Dict[str, Dict[float, float]] = {}
+    S: Dict[str, float] = {}
+    for ccy, sens in bucket_sens.items():
+        WS[ccy] = {T: rw[T] * sens[T] for T in tenors_nodes}
+        S[ccy] = sum(WS[ccy].values())
+
+    if verbose:
+        print("\n[3] Weighted sensitivities WS_k = RW_k * s_k")
+        for ccy in WS:
+            print(f"\n  Bucket {ccy}:")
+            for T in tenors_nodes:
+                if abs(WS[ccy][T]) > 1e-6:
+                    print(f"    T={T:>5}Y | RW={100*rw[T]:.3f}% | WS={fmt_num(WS[ccy][T],6)}")
+            print(f"    S_{ccy}={fmt_num(S[ccy],6)}")
+
+    Kb: Dict[str, Dict[str, float]] = {sc: {} for sc in SCENARIOS}
+
+    if verbose:
+        print("\n[4] Intra-bucket aggregation: K_b = sqrt(WS' rho WS)")
+
+    for sc in SCENARIOS:
+        for ccy in WS:
+            ten_nz = [T for T in tenors_nodes if WS[ccy][T] != 0.0]
+            if not ten_nz:
+                Kb[sc][ccy] = 0.0
+                continue
+
+            rho = corr_matrix_for_tenors(ten_nz, cfg, scenario=sc)
+            w = [WS[ccy][T] for T in ten_nz]
+            val = sum(w[i] * rho[i][j] * w[j] for i in range(len(w)) for j in range(len(w)))
+            Kb[sc][ccy] = math.sqrt(max(val, 0.0))
+
+        if verbose:
+            parts = " | ".join(f"{ccy}: {fmt_int(Kb[sc][ccy])}" for ccy in sorted(WS.keys()))
+            print(f"  {sc.upper()} -> {parts}")
+
+    if verbose:
+        print("\n[5] Inter-bucket aggregation")
+
+    totals: Dict[str, float] = {}
+    for sc in SCENARIOS:
+        g = scenario_gamma(cfg, sc)
+        totals[sc] = inter_bucket(Kb[sc], S, g)
+        if verbose:
+            print(f"  {sc.upper()}: gamma={g:.3f} | K_total={fmt_int(totals[sc])}")
+
+    K_final = max(totals.values())
+    worst = max(totals, key=lambda k: totals[k])
+
+    if verbose:
+        print("\n[6] FINAL GIRR Delta capital")
+        print(f"  >>> GIRR Delta capital = {fmt_int(K_final)} (worst={worst.upper()})")
+
+    return {"K_final": K_final, "totals": totals, "WS": WS, "S": S, "Kb": Kb}
+
+
+# ---- helpers prêts à l'emploi pour swaps & bonds (wrappers)
+
+def sensitivities_swaps(trades: List[SwapTrade], mkt: Market, cfg: GirrConfig, verbose: bool) -> Dict[str, Dict[float, float]]:
+    def prep_swap(tr: SwapTrade, curve0: ZeroCurve) -> float:
+        return par_swap_rate(curve0, tr.maturity)  # K0
+
+    def pv_swap_ctx(tr: SwapTrade, curve: ZeroCurve, K0: float) -> float:
+        return pv_swap(curve, tr.notional, tr.maturity, K0, tr.receive_fixed)
+
+    def print_swap(tr: SwapTrade, pv0_rep: float) -> None:
+        print(f"\n  Swap {tr.name} ({tr.ccy}) | maturity={tr.maturity}Y | receive_fixed={tr.receive_fixed}")
+        print(f"    PV0 ~ {pv0_rep:,.2f} {mkt.reporting_ccy}".replace(",", " ") + " (par swap)")
+
+    return bump_and_reprice_sens(
+        trades=trades, mkt=mkt, cfg=cfg,
+        prepare_ctx=prep_swap, pv_with_ctx=pv_swap_ctx, ccy_func=lambda t: t.ccy,
+        printer=print_swap, verbose=verbose
+    )
+
+
+def sensitivities_bonds(trades: List[BondTrade], mkt: Market, cfg: GirrConfig, verbose: bool) -> Dict[str, Dict[float, float]]:
+    def prep_bond(tr: BondTrade, curve0: ZeroCurve) -> None:
+        return None
+
+    def pv_bond_ctx(tr: BondTrade, curve: ZeroCurve, _: None) -> float:
+        return pv_bond(curve, tr.notional, tr.coupon_rate, tr.maturity)
+
+    def print_bond(tr: BondTrade, pv0_rep: float) -> None:
+        print(f"\n  Bond {tr.name} ({tr.ccy}) | maturity={tr.maturity}Y | PV0={pv0_rep:,.2f} {mkt.reporting_ccy}".replace(",", " "))
+
+    return bump_and_reprice_sens(
+        trades=trades, mkt=mkt, cfg=cfg,
+        prepare_ctx=prep_bond, pv_with_ctx=pv_bond_ctx, ccy_func=lambda t: t.ccy,
+        printer=print_bond, verbose=verbose
+    )
+
+
+### FILE: history_db.py
+# history_db.py
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+
+def db_path() -> Path:
+    # DB à côté de app.py / ui_common.py
+    return Path(__file__).resolve().parent / "frtb_history.sqlite3"
+
+
+def _connect() -> sqlite3.Connection:
+    p = db_path()
+    con = sqlite3.connect(str(p), check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def init_db() -> None:
+    con = _connect()
+    try:
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS runs (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at_utc     TEXT NOT NULL,
+                created_at_local   TEXT NOT NULL,
+                status            TEXT NOT NULL,            -- "ok" / "error"
+                k_eq              REAL,
+                k_sw              REAL,
+                k_bo              REAL,
+                k_total           REAL,
+                portfolio_csv     TEXT,
+                snapshot_json     TEXT,
+                results_json      TEXT,
+                logs_txt          TEXT,
+                meta_json         TEXT,
+                error_txt         TEXT
+            );
+            """
+        )
+        con.execute("CREATE INDEX IF NOT EXISTS idx_runs_created_at ON runs(created_at_utc);")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);")
+        con.commit()
+    finally:
+        con.close()
+
+
+def insert_run(rec: Dict[str, Any]) -> int:
+    init_db()
+    con = _connect()
+    try:
+        cols = [
+            "created_at_utc",
+            "created_at_local",
+            "status",
+            "k_eq",
+            "k_sw",
+            "k_bo",
+            "k_total",
+            "portfolio_csv",
+            "snapshot_json",
+            "results_json",
+            "logs_txt",
+            "meta_json",
+            "error_txt",
+        ]
+        vals = [rec.get(c) for c in cols]
+        q = f"INSERT INTO runs ({','.join(cols)}) VALUES ({','.join(['?']*len(cols))})"
+        cur = con.execute(q, vals)
+        con.commit()
+        return int(cur.lastrowid)
+    finally:
+        con.close()
+
+
+def list_runs(limit: int = 200, status: Optional[str] = None) -> List[Dict[str, Any]]:
+    init_db()
+    con = _connect()
+    try:
+        if status in ("ok", "error"):
+            cur = con.execute(
+                """
+                SELECT id, created_at_local, created_at_utc, status, k_eq, k_sw, k_bo, k_total
+                FROM runs
+                WHERE status = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (status, int(limit)),
+            )
+        else:
+            cur = con.execute(
+                """
+                SELECT id, created_at_local, created_at_utc, status, k_eq, k_sw, k_bo, k_total
+                FROM runs
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            )
+        return [dict(r) for r in cur.fetchall()]
+    finally:
+        con.close()
+
+
+def get_run(run_id: int) -> Optional[Dict[str, Any]]:
+    init_db()
+    con = _connect()
+    try:
+        cur = con.execute("SELECT * FROM runs WHERE id = ?", (int(run_id),))
+        row = cur.fetchone()
+        return dict(row) if row else None
+    finally:
+        con.close()
+
+
+def delete_run(run_id: int) -> None:
+    init_db()
+    con = _connect()
+    try:
+        con.execute("DELETE FROM runs WHERE id = ?", (int(run_id),))
+        con.commit()
+    finally:
+        con.close()
+
+
+def clear_all() -> None:
+    init_db()
+    con = _connect()
+    try:
+        con.execute("DELETE FROM runs")
+        con.commit()
+    finally:
+        con.close()
+
+
+### FILE: main.py
+# main.py
+from __future__ import annotations
+
+import argparse
+
+from demo import (
+    demo_equity_config,
+    demo_girr_cfg_bonds,
+    demo_girr_cfg_swaps,
+    demo_market,
+    demo_portfolio,
+)
+from engine import FRTBEngine
+from portfolio import load_portfolio_csv
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--portfolio", type=str, default="", help="CSV portfolio path (optional)")
+    ap.add_argument("--quiet", action="store_true", help="moins de prints")
+    args = ap.parse_args()
+
+    port = load_portfolio_csv(args.portfolio) if args.portfolio else demo_portfolio()
+
+    mkt, bond_override = demo_market()
+    engine = FRTBEngine(
+        market=mkt,
+        equity_cfg=demo_equity_config(),
+        girr_cfg_swaps=demo_girr_cfg_swaps(),
+        girr_cfg_bonds=demo_girr_cfg_bonds(),
+    )
+
+    engine.run(
+        port=port,
+        bond_curves_override=bond_override,
+        verbose=not args.quiet,
+    )
+
+
+if __name__ == "__main__":
+    main()
+
+
+### FILE: market.py
+# frtb/market.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Tuple
+
+from curves import ZeroCurve
+
+
+@dataclass(frozen=True)
+class Market:
+    reporting_ccy: str
+    fx: Dict[Tuple[str, str], float]     # (from,to) -> rate
+    curves: Dict[str, ZeroCurve]         # ccy -> curve
+
+    def convert(self, amount: float, from_ccy: str, to_ccy: str) -> float:
+        if from_ccy == to_ccy:
+            return amount
+        key = (from_ccy, to_ccy)
+        if key not in self.fx:
+            raise ValueError(f"FX manquant pour {from_ccy}->{to_ccy}")
+        return amount * self.fx[key]
+
+
+### FILE: portfolio.py
+# frtb/portfolio.py
+from __future__ import annotations
+
+import csv
+from dataclasses import dataclass
+from typing import List
+
+
+@dataclass
+class EquityCallTrade:
+    name: str
+    bucket: int
+    N: float
+    S0: float
+    K: float
+    T: float
+    r: float
+    q_repo: float
+    sigma: float
+
+
+@dataclass
+class SwapTrade:
+    name: str
+    ccy: str
+    notional: float
+    maturity: int
+    receive_fixed: bool  # True Receive-Fixed, False Pay-Fixed
+
+
+@dataclass
+class BondTrade:
+    name: str
+    ccy: str
+    notional: float
+    coupon_rate: float
+    maturity: int
+
+
+@dataclass
+class Portfolio:
+    equity_calls: List[EquityCallTrade]
+    girr_swaps: List[SwapTrade]
+    girr_bonds: List[BondTrade]
+
+
+def load_portfolio_csv(path: str) -> Portfolio:
+    eq: List[EquityCallTrade] = []
+    sw: List[SwapTrade] = []
+    bo: List[BondTrade] = []
+
+    with open(path, "r", newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            t = (row.get("type") or "").strip().upper()
+            if t == "EQUITY_CALL":
+                eq.append(EquityCallTrade(
+                    name=row["name"],
+                    bucket=int(row["bucket"]),
+                    N=float(row["N"]),
+                    S0=float(row["S0"]),
+                    K=float(row["K"]),
+                    T=float(row["T"]),
+                    r=float(row["r"]),
+                    q_repo=float(row["q_repo"]),
+                    sigma=float(row["sigma"]),
+                ))
+            elif t == "GIRR_SWAP":
+                sw.append(SwapTrade(
+                    name=row["name"],
+                    ccy=row["ccy"].strip().upper(),
+                    notional=float(row["notional"]),
+                    maturity=int(row["maturity"]),
+                    receive_fixed=bool(int(row["receive_fixed"])),
+                ))
+            elif t == "GIRR_BOND":
+                bo.append(BondTrade(
+                    name=row["name"],
+                    ccy=row["ccy"].strip().upper(),
+                    notional=float(row["notional"]),
+                    coupon_rate=float(row["coupon_rate"]),
+                    maturity=int(row["maturity"]),
+                ))
+            elif not t:
+                continue
+            else:
+                raise ValueError(f"type inconnu: {t}")
+
+    return Portfolio(eq, sw, bo)
+
+
+### FILE: ui_common.py
+# ui_common.py
+from __future__ import annotations
+
+import contextlib
+import csv
+import io
+import json
+from dataclasses import asdict, is_dataclass
+from typing import Any, Dict, List, Optional, Tuple
+import datetime
+from history_db import init_db as history_init_db, insert_run as history_insert_run
+
+
+import streamlit as st
+
+# Imports de TON projet (mêmes noms que main.py)
+from curves import ZeroCurve
+from demo import (
+    demo_equity_config,
+    demo_girr_cfg_bonds,
+    demo_girr_cfg_swaps,
+    demo_market,
+    demo_portfolio,
+)
+from engine import FRTBEngine
+from market import Market
+from portfolio import BondTrade, EquityCallTrade, Portfolio, SwapTrade
+from utils import fmt_int, fmt_money
+
+
+# ----------------------------
+# UX / page config
+# ----------------------------
+def apply_page_config() -> None:
+    st.set_page_config(
+        page_title="FRTB SBM Dashboard",
+        page_icon="📊",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+
+
+def apply_pro_css() -> None:
+    st.markdown(
+        """
+<style>
+/* Spacing + cards */
+.block-container { padding-top: 1.2rem; padding-bottom: 2rem; }
+div[data-testid="stMetric"] { background: rgba(255,255,255,0.04); padding: 14px; border-radius: 14px; border: 1px solid rgba(255,255,255,0.08); }
+section[data-testid="stSidebar"] > div { padding-top: 1rem; }
+hr { opacity: .25; }
+.small-note { opacity: .75; font-size: 0.92rem; }
+</style>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+# ----------------------------
+# Session state init
+# ----------------------------
+def init_session_state() -> None:
+    if "portfolio" not in st.session_state:
+        st.session_state["portfolio"] = demo_portfolio()
+
+    if "market" not in st.session_state or "bond_override" not in st.session_state:
+        mkt, bond_override = demo_market()
+        st.session_state["market"] = mkt
+        st.session_state["bond_override"] = bond_override
+
+    if "equity_cfg" not in st.session_state:
+        st.session_state["equity_cfg"] = demo_equity_config()
+
+    if "girr_cfg_swaps" not in st.session_state:
+        st.session_state["girr_cfg_swaps"] = demo_girr_cfg_swaps()
+
+    if "girr_cfg_bonds" not in st.session_state:
+        st.session_state["girr_cfg_bonds"] = demo_girr_cfg_bonds()
+
+    # results
+    st.session_state.setdefault("last_run", None)
+    st.session_state.setdefault("last_logs", "")
+    st.session_state.setdefault("last_run_error", "")
+        # history db
+    try:
+        history_init_db()
+    except Exception:
+        # si l'environnement est read-only, on ne casse pas l'app
+        pass
+
+
+
+def summary_kpis() -> Dict[str, Any]:
+    p: Portfolio = st.session_state["portfolio"]
+    status = "—"
+    if st.session_state.get("last_run_error"):
+        status = "❌ erreur"
+    elif st.session_state.get("last_run") is not None:
+        status = "✅ ok"
+    return {
+        "n_eq": len(p.equity_calls),
+        "n_sw": len(p.girr_swaps),
+        "n_bo": len(p.girr_bonds),
+        "last_run_status": status,
+    }
+
+
+# ----------------------------
+# Conversions (Portfolio <-> rows)
+# ----------------------------
+def equity_rows_from_portfolio(p: Portfolio) -> List[Dict[str, Any]]:
+    return [asdict(t) for t in p.equity_calls]
+
+
+def swaps_rows_from_portfolio(p: Portfolio) -> List[Dict[str, Any]]:
+    return [asdict(t) for t in p.girr_swaps]
+
+
+def bonds_rows_from_portfolio(p: Portfolio) -> List[Dict[str, Any]]:
+    return [asdict(t) for t in p.girr_bonds]
+
+
+def portfolio_from_rows(
+    eq_rows: List[Dict[str, Any]],
+    sw_rows: List[Dict[str, Any]],
+    bo_rows: List[Dict[str, Any]],
+) -> Portfolio:
+    eq: List[EquityCallTrade] = []
+    for r in eq_rows:
+        if not r or all(str(v).strip() == "" for v in r.values()):
+            continue
+        eq.append(
+            EquityCallTrade(
+                name=str(r["name"]),
+                bucket=int(r["bucket"]),
+                N=float(r["N"]),
+                S0=float(r["S0"]),
+                K=float(r["K"]),
+                T=float(r["T"]),
+                r=float(r["r"]),
+                q_repo=float(r["q_repo"]),
+                sigma=float(r["sigma"]),
+            )
+        )
+
+    sw: List[SwapTrade] = []
+    for r in sw_rows:
+        if not r or all(str(v).strip() == "" for v in r.values()):
+            continue
+        sw.append(
+            SwapTrade(
+                name=str(r["name"]),
+                ccy=str(r["ccy"]).strip().upper(),
+                notional=float(r["notional"]),
+                maturity=int(r["maturity"]),
+                receive_fixed=bool(r["receive_fixed"]),
+            )
+        )
+
+    bo: List[BondTrade] = []
+    for r in bo_rows:
+        if not r or all(str(v).strip() == "" for v in r.values()):
+            continue
+        bo.append(
+            BondTrade(
+                name=str(r["name"]),
+                ccy=str(r["ccy"]).strip().upper(),
+                notional=float(r["notional"]),
+                coupon_rate=float(r["coupon_rate"]),
+                maturity=int(r["maturity"]),
+            )
+        )
+
+    return Portfolio(eq, sw, bo)
+
+
+# ----------------------------
+# CSV portfolio (upload/download)
+# ----------------------------
+def portfolio_to_csv(p: Portfolio) -> str:
+    buf = io.StringIO()
+    fieldnames = [
+        "type",
+        "name",
+        "bucket",
+        "N",
+        "S0",
+        "K",
+        "T",
+        "r",
+        "q_repo",
+        "sigma",
+        "ccy",
+        "notional",
+        "maturity",
+        "receive_fixed",
+        "coupon_rate",
+    ]
+    w = csv.DictWriter(buf, fieldnames=fieldnames)
+    w.writeheader()
+
+    for t in p.equity_calls:
+        w.writerow(
+            {
+                "type": "EQUITY_CALL",
+                "name": t.name,
+                "bucket": t.bucket,
+                "N": t.N,
+                "S0": t.S0,
+                "K": t.K,
+                "T": t.T,
+                "r": t.r,
+                "q_repo": t.q_repo,
+                "sigma": t.sigma,
+            }
+        )
+
+    for t in p.girr_swaps:
+        w.writerow(
+            {
+                "type": "GIRR_SWAP",
+                "name": t.name,
+                "ccy": t.ccy,
+                "notional": t.notional,
+                "maturity": t.maturity,
+                "receive_fixed": int(bool(t.receive_fixed)),
+            }
+        )
+
+    for t in p.girr_bonds:
+        w.writerow(
+            {
+                "type": "GIRR_BOND",
+                "name": t.name,
+                "ccy": t.ccy,
+                "notional": t.notional,
+                "coupon_rate": t.coupon_rate,
+                "maturity": t.maturity,
+            }
+        )
+
+    return buf.getvalue()
+
+
+def portfolio_from_csv_text(text: str) -> Portfolio:
+    eq: List[EquityCallTrade] = []
+    sw: List[SwapTrade] = []
+    bo: List[BondTrade] = []
+
+    f = io.StringIO(text)
+    r = csv.DictReader(f)
+    for row in r:
+        t = (row.get("type") or "").strip().upper()
+        if t == "EQUITY_CALL":
+            eq.append(
+                EquityCallTrade(
+                    name=row["name"],
+                    bucket=int(row["bucket"]),
+                    N=float(row["N"]),
+                    S0=float(row["S0"]),
+                    K=float(row["K"]),
+                    T=float(row["T"]),
+                    r=float(row["r"]),
+                    q_repo=float(row["q_repo"]),
+                    sigma=float(row["sigma"]),
+                )
+            )
+        elif t == "GIRR_SWAP":
+            sw.append(
+                SwapTrade(
+                    name=row["name"],
+                    ccy=row["ccy"].strip().upper(),
+                    notional=float(row["notional"]),
+                    maturity=int(row["maturity"]),
+                    receive_fixed=bool(int(row["receive_fixed"])),
+                )
+            )
+        elif t == "GIRR_BOND":
+            bo.append(
+                BondTrade(
+                    name=row["name"],
+                    ccy=row["ccy"].strip().upper(),
+                    notional=float(row["notional"]),
+                    coupon_rate=float(row["coupon_rate"]),
+                    maturity=int(row["maturity"]),
+                )
+            )
+        elif not t:
+            continue
+        else:
+            raise ValueError(f"type inconnu: {t}")
+
+    return Portfolio(eq, sw, bo)
+
+
+# ----------------------------
+# Market <-> rows
+# ----------------------------
+def curve_to_rows(curve: ZeroCurve) -> List[Dict[str, Any]]:
+    return [{"tenor": float(T), "zero": float(z)} for T, z in zip(curve.tenors, curve.zeros)]
+
+
+def rows_to_curve(rows: List[Dict[str, Any]]) -> ZeroCurve:
+    clean = []
+    for r in rows:
+        if r is None:
+            continue
+        if "tenor" not in r or "zero" not in r:
+            continue
+        if str(r["tenor"]).strip() == "" or str(r["zero"]).strip() == "":
+            continue
+        clean.append((float(r["tenor"]), float(r["zero"])))
+
+    if not clean:
+        raise ValueError("Courbe vide")
+    clean.sort(key=lambda x: x[0])
+
+    ten = tuple(t for t, _ in clean)
+    if any(ten[i] <= 0.0 for i in range(len(ten))):
+        raise ValueError("Tenors doivent être > 0")
+    if any(ten[i] >= ten[i + 1] for i in range(len(ten) - 1)):
+        raise ValueError("Tenors doivent être strictement croissants")
+
+    z = tuple(v for _, v in clean)
+    return ZeroCurve(ten, z)
+
+
+def fx_to_rows(fx: Dict[Tuple[str, str], float]) -> List[Dict[str, Any]]:
+    rows = []
+    for (f, t), v in sorted(fx.items()):
+        rows.append({"from": f, "to": t, "rate": float(v)})
+    return rows
+
+
+def rows_to_fx(rows: List[Dict[str, Any]]) -> Dict[Tuple[str, str], float]:
+    out: Dict[Tuple[str, str], float] = {}
+    for r in rows:
+        f = str(r.get("from", "")).strip().upper()
+        t = str(r.get("to", "")).strip().upper()
+        if not f or not t:
+            continue
+        out[(f, t)] = float(r.get("rate"))
+    return out
+
+
+def update_market_curves(mkt: Market, curves_by_ccy: Dict[str, ZeroCurve], fx: Optional[Dict[Tuple[str, str], float]] = None) -> Market:
+    new_fx = dict(mkt.fx) if fx is None else dict(fx)
+    new_curves = dict(mkt.curves)
+    for ccy, c in curves_by_ccy.items():
+        new_curves[ccy] = c
+    return Market(reporting_ccy=mkt.reporting_ccy, fx=new_fx, curves=new_curves)
+
+
+# ----------------------------
+# Engine run (capture prints)
+# ----------------------------
+def build_engine_from_state() -> FRTBEngine:
+    return FRTBEngine(
+        market=st.session_state["market"],
+        equity_cfg=st.session_state["equity_cfg"],
+        girr_cfg_swaps=st.session_state["girr_cfg_swaps"],
+        girr_cfg_bonds=st.session_state["girr_cfg_bonds"],
+    )
+
+
+def run_engine(port: Portfolio, use_bond_override: bool, verbose: bool) -> Tuple[Dict[str, Any], str]:
+    engine = build_engine_from_state()
+    bond_override = st.session_state["bond_override"] if use_bond_override else None
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        res = engine.run(port=port, bond_curves_override=bond_override, verbose=verbose)
+    logs = buf.getvalue()
+    return res, logs
+
+
+# ----------------------------
+# Serialization for export
+# ----------------------------
+def to_jsonable(x: Any) -> Any:
+    if is_dataclass(x):
+        return {k: to_jsonable(v) for k, v in asdict(x).items()}
+    if isinstance(x, dict):
+        return {str(k): to_jsonable(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [to_jsonable(v) for v in x]
+    if isinstance(x, (int, float, str, bool)) or x is None:
+        return x
+    return str(x)
+
+
+def results_to_json(res: Dict[str, Any]) -> str:
+    return json.dumps(to_jsonable(res), indent=2, ensure_ascii=False)
+
+
+def pretty_capital_block(res: Dict[str, Any]) -> Dict[str, str]:
+    # res = {"equity":..., "girr_swaps":..., "girr_bonds":...}
+    K_eq = float(res.get("equity", {}).get("K_final", 0.0))
+    K_sw = float(res.get("girr_swaps", {}).get("K_final", 0.0))
+    K_bo = float(res.get("girr_bonds", {}).get("K_final", 0.0))
+    return {
+        "Equity": fmt_money(K_eq),
+        "GIRR Swaps": fmt_money(K_sw),
+        "GIRR Bonds": fmt_money(K_bo),
+        "Total (somme)": fmt_money(K_eq + K_sw + K_bo),
+    }
+
+
+def save_run_history(
+    *,
+    port: Portfolio,
+    res: Optional[Dict[str, Any]],
+    logs: str,
+    use_bond_override: bool,
+    verbose: bool,
+    status: str = "ok",
+    error_txt: str = "",
+) -> Optional[int]:
+    """
+    Enregistre un run (ok/erreur) en base SQLite.
+    Retourne run_id si succès, sinon None.
+    """
+    try:
+        # timestamps
+        now_local = datetime.datetime.now().isoformat(timespec="seconds")
+        now_utc = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+        # KPIs
+        K_eq = float((res or {}).get("equity", {}).get("K_final", 0.0))
+        K_sw = float((res or {}).get("girr_swaps", {}).get("K_final", 0.0))
+        K_bo = float((res or {}).get("girr_bonds", {}).get("K_final", 0.0))
+        K_total = K_eq + K_sw + K_bo
+
+        # portfolio CSV (pratique pour download)
+        port_csv = portfolio_to_csv(port)
+
+        # snapshot JSON (état complet)
+        snap = {
+            "portfolio": to_jsonable(port),
+            "market": to_jsonable(st.session_state["market"]),
+            "equity_cfg": to_jsonable(st.session_state["equity_cfg"]),
+            "girr_cfg_swaps": to_jsonable(st.session_state["girr_cfg_swaps"]),
+            "girr_cfg_bonds": to_jsonable(st.session_state["girr_cfg_bonds"]),
+            "bond_override_used": bool(use_bond_override),
+            "verbose": bool(verbose),
+            "bond_override": to_jsonable(st.session_state.get("bond_override")) if use_bond_override else None,
+        }
+        snap_json = json.dumps(snap, indent=2, ensure_ascii=False)
+
+        # results JSON
+        res_json = results_to_json(res or {})
+
+        meta = {
+            "use_bond_override": bool(use_bond_override),
+            "verbose": bool(verbose),
+        }
+        meta_json = json.dumps(meta, indent=2, ensure_ascii=False)
+
+        run_id = history_insert_run(
+            {
+                "created_at_utc": now_utc,
+                "created_at_local": now_local,
+                "status": "error" if status != "ok" else "ok",
+                "k_eq": K_eq,
+                "k_sw": K_sw,
+                "k_bo": K_bo,
+                "k_total": K_total,
+                "portfolio_csv": port_csv,
+                "snapshot_json": snap_json,
+                "results_json": res_json,
+                "logs_txt": logs or "",
+                "meta_json": meta_json,
+                "error_txt": error_txt or "",
+            }
+        )
+        return run_id
+    except Exception:
+        return None
+
+
+### FILE: utils.py
+# frtb/utils.py
+from __future__ import annotations
+
+import math
+from typing import Any, Dict, Tuple
+
+SCENARIOS: Tuple[str, str, str] = ("low", "medium", "high")
+
+
+def fmt_money(x: float) -> str:
+    sign = "-" if x < 0 else ""
+    return f"{sign}{abs(x):,.2f}".replace(",", " ")
+
+
+def fmt_num(x: float, nd: int = 6) -> str:
+    return f"{x:,.{nd}f}".replace(",", " ")
+
+
+def fmt_int(x: float) -> str:
+    return f"{x:,.0f}".replace(",", " ")
+
+
+def pct(x: float) -> str:
+    return f"{100.0 * x:.6f}%"
+
+
+def clip_corr(x: float) -> float:
+    return max(min(x, 1.0), -1.0)
+
+
+def low_med_high(base: float) -> Dict[str, float]:
+    """
+    Règle low/medium/high utilisée dans tes scripts equity/swap:
+      low  = max(2*base - 1, 0.75*base)
+      med  = base
+      high = min(1.25*base, 1)
+    """
+    return {
+        "low": max(2.0 * base - 1.0, 0.75 * base),
+        "medium": base,
+        "high": min(1.25 * base, 1.0),
+    }
+
+
+def basel_scale(base: float, scenario: str) -> float:
+    """Règle 0.75 / 1 / 1.25 (bond.py)."""
+    if scenario == "low":
+        return 0.75 * base
+    if scenario == "medium":
+        return 1.00 * base
+    if scenario == "high":
+        return 1.25 * base
+    raise ValueError("scenario must be low/medium/high")
+
+
+def inter_bucket(Kb: Dict[Any, float], X: Dict[Any, float], gamma: float) -> float:
+    """
+    Formule générique inter-bucket:
+      K = sqrt( sum_b Kb[b]^2 + sum_{i<j} 2*gamma*X[i]*X[j] )
+
+    - Pour Delta/Vega: X = S_b
+    - Pour Curvature:  X = K_b^curv (comme ton code)
+    """
+    keys = sorted(Kb.keys())
+    base = sum(Kb[k] ** 2 for k in keys)
+    cross = 0.0
+    for i in range(len(keys)):
+        for j in range(i + 1, len(keys)):
+            cross += 2.0 * gamma * X[keys[i]] * X[keys[j]]
+    return math.sqrt(max(base + cross, 0.0))
+
+
+### FILE: __init__.py
+# frtb/__init__.py
+__all__ = [
+    "utils",
+    "market",
+    "curves",
+    "portfolio",
+    "equity",
+    "girr",
+    "demo",
+    "engine",
+]
+
+
+### FILE: pages\1_🏠_Overview.py
+from __future__ import annotations
+
+import streamlit as st
+from ui_common import apply_page_config, apply_pro_css, init_session_state, summary_kpis
+
+apply_page_config()
+apply_pro_css()
+init_session_state()
+
+st.title("🏠 Overview")
+st.markdown(
+    """
+Cette app expose un moteur **FRTB SA / SBM** via une interface :
+- Portfolio (édition)
+- Marché (courbes + FX)
+- Configs (GIRR)
+- Run + résultats + logs
+- Export
+- Historique
+
+"""
+)
+
+k = summary_kpis()
+c1, c2, c3 = st.columns(3)
+c1.metric("Equity trades", k["n_eq"])
+c2.metric("GIRR swaps", k["n_sw"])
+c3.metric("GIRR bonds", k["n_bo"])
+
+st.info("Allez dans **Portfolio** pour éditer, puis **Run & Results** pour exécuter.")
+
+
+### FILE: pages\2_📦_Portfolio.py
+from __future__ import annotations
+
+import streamlit as st
+
+from ui_common import (
+    apply_page_config,
+    apply_pro_css,
+    bonds_rows_from_portfolio,
+    equity_rows_from_portfolio,
+    init_session_state,
+    portfolio_from_rows,
+    portfolio_to_csv,
+    swaps_rows_from_portfolio,
+)
+from demo import demo_portfolio
+
+apply_page_config()
+apply_pro_css()
+init_session_state()
+
+st.title("📦 Portfolio")
+st.caption("Édition interactive du portfolio. Le portfolio courant est stocké en session.")
+
+# Top actions
+colA, colB = st.columns([1, 1])
+with colA:
+    if st.button("Reset → Demo portfolio", use_container_width=True, key="pf_reset_demo_top"):
+        st.session_state["portfolio"] = demo_portfolio()
+        st.success("Portfolio réinitialisé ✅")
+
+with colB:
+    st.download_button(
+        "⬇️ Télécharger le portfolio courant (CSV)",
+        data=portfolio_to_csv(st.session_state["portfolio"]),
+        file_name="portfolio.csv",
+        mime="text/csv",
+        use_container_width=True,
+        key="pf_download_csv",
+    )
+
+st.divider()
+
+p = st.session_state["portfolio"]
+
+tab1, tab2, tab3 = st.tabs(["Equity Calls", "GIRR Swaps", "GIRR Bonds"])
+
+with tab1:
+    rows = equity_rows_from_portfolio(p)
+    edited = st.data_editor(
+        rows,
+        num_rows="dynamic",
+        use_container_width=True,
+        key="pf_eq_editor",
+        column_config={
+            "bucket": st.column_config.NumberColumn("bucket", step=1),
+            "N": st.column_config.NumberColumn("N"),
+            "S0": st.column_config.NumberColumn("S0"),
+            "K": st.column_config.NumberColumn("K"),
+            "T": st.column_config.NumberColumn("T"),
+            "r": st.column_config.NumberColumn("r"),
+            "q_repo": st.column_config.NumberColumn("q_repo"),
+            "sigma": st.column_config.NumberColumn("sigma"),
+        },
+    )
+    st.session_state["_eq_rows"] = edited
+
+with tab2:
+    rows = swaps_rows_from_portfolio(p)
+    edited = st.data_editor(
+        rows,
+        num_rows="dynamic",
+        use_container_width=True,
+        key="pf_sw_editor",
+        column_config={
+            "ccy": st.column_config.TextColumn("ccy"),
+            "notional": st.column_config.NumberColumn("notional"),
+            "maturity": st.column_config.NumberColumn("maturity", step=1),
+            "receive_fixed": st.column_config.CheckboxColumn("receive_fixed"),
+        },
+    )
+    st.session_state["_sw_rows"] = edited
+
+with tab3:
+    rows = bonds_rows_from_portfolio(p)
+    edited = st.data_editor(
+        rows,
+        num_rows="dynamic",
+        use_container_width=True,
+        key="pf_bo_editor",
+        column_config={
+            "ccy": st.column_config.TextColumn("ccy"),
+            "notional": st.column_config.NumberColumn("notional"),
+            "coupon_rate": st.column_config.NumberColumn("coupon_rate"),
+            "maturity": st.column_config.NumberColumn("maturity", step=1),
+        },
+    )
+    st.session_state["_bo_rows"] = edited
+
+st.divider()
+
+c1, c2 = st.columns([1, 2])
+with c1:
+    if st.button("✅ Appliquer les modifications", use_container_width=True, key="pf_apply_btn"):
+        try:
+            eq_rows = st.session_state.get("_eq_rows", [])
+            sw_rows = st.session_state.get("_sw_rows", [])
+            bo_rows = st.session_state.get("_bo_rows", [])
+            st.session_state["portfolio"] = portfolio_from_rows(eq_rows, sw_rows, bo_rows)
+            st.success("Portfolio mis à jour ✅")
+        except Exception as e:
+            st.error(f"Erreur de validation: {e}")
+
+with c2:
+    st.markdown(
+        '<span class="small-note">Astuce : éditez 1–2 trades puis lancez un run pour valider la chaîne complète.</span>',
+        unsafe_allow_html=True,
+    )
+
+
+### FILE: pages\3_📈_Market.py
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+from ui_common import (
+    apply_page_config,
+    apply_pro_css,
+    curve_to_rows,
+    fx_to_rows,
+    init_session_state,
+    rows_to_curve,
+    rows_to_fx,
+    update_market_curves,
+)
+
+apply_page_config()
+apply_pro_css()
+init_session_state()
+
+st.title("📈 Market")
+st.caption("Édition des courbes (zéro rates) et FX. Le marché courant est stocké en session.")
+
+mkt = st.session_state["market"]
+
+tabs = st.tabs(["Curves", "FX", "Charts"])
+
+with tabs[0]:
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.subheader("EUR ZeroCurve")
+        eur_rows = curve_to_rows(mkt.curves["EUR"])
+        eur_edit = st.data_editor(eur_rows, num_rows="dynamic", use_container_width=True)
+        st.session_state["_eur_curve_rows"] = eur_edit
+
+    with c2:
+        st.subheader("USD ZeroCurve")
+        usd_rows = curve_to_rows(mkt.curves["USD"])
+        usd_edit = st.data_editor(usd_rows, num_rows="dynamic", use_container_width=True)
+        st.session_state["_usd_curve_rows"] = usd_edit
+
+    if st.button("Appliquer les courbes", use_container_width=True):
+        try:
+            eur = rows_to_curve(st.session_state["_eur_curve_rows"])
+            usd = rows_to_curve(st.session_state["_usd_curve_rows"])
+            st.session_state["market"] = update_market_curves(mkt, {"EUR": eur, "USD": usd})
+            st.success("Courbes mises à jour ✅")
+        except Exception as e:
+            st.error(f"Erreur courbe: {e}")
+
+with tabs[1]:
+    st.subheader("FX")
+    fx_rows = fx_to_rows(mkt.fx)
+    fx_edit = st.data_editor(
+        fx_rows,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "from": st.column_config.TextColumn("from"),
+            "to": st.column_config.TextColumn("to"),
+            "rate": st.column_config.NumberColumn("rate"),
+        },
+    )
+    if st.button("Appliquer FX", use_container_width=True):
+        try:
+            fx = rows_to_fx(fx_edit)
+            st.session_state["market"] = update_market_curves(mkt, {}, fx=fx)
+            st.success("FX mis à jour ✅")
+        except Exception as e:
+            st.error(f"Erreur FX: {e}")
+
+with tabs[2]:
+    st.subheader("Visualisation")
+    c1, c2 = st.columns(2)
+
+    # re-lire le market depuis session (au cas où il vient d’être modifié)
+    mkt2 = st.session_state["market"]
+
+    for ccy, col in [("EUR", c1), ("USD", c2)]:
+        with col:
+            curve = mkt2.curves[ccy]
+            st.markdown(f"**{ccy}**")
+
+            ten = np.array(curve.tenors, dtype=float)
+            z = np.array(curve.zeros, dtype=float)
+
+            df_zero = pd.DataFrame({"tenor": ten, "zero": z})
+            st.line_chart(df_zero, x="tenor", y="zero", use_container_width=True)
+
+            grid = np.linspace(float(ten[0]), float(ten[-1]), 80)
+            dfs = np.array([curve.df(float(t)) for t in grid], dtype=float)
+
+            df_df = pd.DataFrame({"t": grid, "df": dfs})
+            st.line_chart(df_df, x="t", y="df", use_container_width=True)
+
+
+### FILE: pages\4_⚙️_Configs.py
+from __future__ import annotations
+
+import streamlit as st
+
+from ui_common import apply_page_config, apply_pro_css, init_session_state
+
+apply_page_config()
+apply_pro_css()
+init_session_state()
+
+st.title("⚙️ Configs")
+st.caption("Paramètres GIRR uniquement. Édition simple, stockée en session.")
+
+sw_cfg = st.session_state["girr_cfg_swaps"]
+bo_cfg = st.session_state["girr_cfg_bonds"]
+
+# -------------------------------------------------------------------
+# Valeurs FIXÉES (non éditables) demandées
+# -------------------------------------------------------------------
+# Choix par défaut: on fige à la valeur actuelle des configs en session
+# (comme ça tu gardes tes valeurs 'demo' ou celles restaurées depuis Historique)
+FIXED_SW_BUMP_BP = float(sw_cfg.bump_bp)
+FIXED_SW_GAMMA_MED = float(sw_cfg.gamma_inter_ccy_med)
+
+FIXED_BO_BUMP_BP = float(bo_cfg.bump_bp)
+FIXED_BO_GAMMA_MED = float(bo_cfg.gamma_inter_ccy_med)
+
+tab_sw, tab_bo = st.tabs(["GIRR Swaps", "GIRR Bonds"])
+
+# -----------------------------
+# TAB — GIRR Swaps
+# -----------------------------
+with tab_sw:
+    st.subheader("GirrConfig — Swaps")
+
+    # RW tenors editor
+    rw_rows = [{"tenor": float(T), "rw": float(v)} for T, v in sorted(sw_cfg.rw_by_tenor.items())]
+    rw_edit = st.data_editor(
+        rw_rows,
+        num_rows="dynamic",
+        use_container_width=True,
+        key="sw_rw_editor",
+        column_config={
+            "tenor": st.column_config.NumberColumn("tenor", format="%.4f"),
+            "rw": st.column_config.NumberColumn("rw", format="%.8f"),
+        },
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        specified = st.checkbox(
+            "specified_currency_reduction",
+            value=bool(sw_cfg.specified_currency_reduction),
+            key="sw_specified_currency_reduction",
+        )
+    with c2:
+        st.markdown("**Paramètres fixés**")
+        st.text(f"bump_bp = {FIXED_SW_BUMP_BP:.8f}")
+        st.text(f"gamma_inter_ccy_med = {FIXED_SW_GAMMA_MED:.6f}")
+        st.text(f"scenario_rule = {sw_cfg.scenario_rule}")
+        st.text(f"rho_rule = {sw_cfg.rho_rule}")
+        st.text(f"rho_param = {float(sw_cfg.rho_param):.6f}")
+
+    if st.button("Appliquer GIRR Swaps config", use_container_width=True, key="sw_apply_btn"):
+        try:
+            from girr import GirrConfig
+
+            rw_by_tenor = {float(r["tenor"]): float(r["rw"]) for r in rw_edit}
+
+            # On conserve scenario_rule / rho_rule / rho_param (mais non éditables)
+            st.session_state["girr_cfg_swaps"] = GirrConfig(
+                rw_by_tenor=rw_by_tenor,
+                specified_currency_reduction=bool(specified),
+                bump_bp=float(FIXED_SW_BUMP_BP),
+                gamma_inter_ccy_med=float(FIXED_SW_GAMMA_MED),
+                scenario_rule=str(sw_cfg.scenario_rule),
+                rho_rule=str(sw_cfg.rho_rule),
+                rho_param=float(sw_cfg.rho_param),
+            )
+            st.success("Config swaps mise à jour ✅")
+        except Exception as e:
+            st.error(f"Erreur config swaps: {e}")
+
+# -----------------------------
+# TAB — GIRR Bonds
+# -----------------------------
+with tab_bo:
+    st.subheader("GirrConfig — Bonds")
+
+    rw_rows = [{"tenor": float(T), "rw": float(v)} for T, v in sorted(bo_cfg.rw_by_tenor.items())]
+    rw_edit = st.data_editor(
+        rw_rows,
+        num_rows="dynamic",
+        use_container_width=True,
+        key="bo_rw_editor",
+        column_config={
+            "tenor": st.column_config.NumberColumn("tenor", format="%.4f"),
+            "rw": st.column_config.NumberColumn("rw", format="%.8f"),
+        },
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        specified = st.checkbox(
+            "specified_currency_reduction",
+            value=bool(bo_cfg.specified_currency_reduction),
+            key="bo_specified_currency_reduction",
+        )
+    with c2:
+        st.markdown("**Paramètres fixés**")
+        st.text(f"bump_bp = {FIXED_BO_BUMP_BP:.8f}")
+        st.text(f"gamma_inter_ccy_med = {FIXED_BO_GAMMA_MED:.6f}")
+        st.text(f"scenario_rule = {bo_cfg.scenario_rule}")
+        st.text(f"rho_rule = {bo_cfg.rho_rule}")
+        st.text(f"rho_param = {float(bo_cfg.rho_param):.6f}")
+
+    if st.button("Appliquer GIRR Bonds config", use_container_width=True, key="bo_apply_btn"):
+        try:
+            from girr import GirrConfig
+
+            rw_by_tenor = {float(r["tenor"]): float(r["rw"]) for r in rw_edit}
+
+            st.session_state["girr_cfg_bonds"] = GirrConfig(
+                rw_by_tenor=rw_by_tenor,
+                specified_currency_reduction=bool(specified),
+                bump_bp=float(FIXED_BO_BUMP_BP),
+                gamma_inter_ccy_med=float(FIXED_BO_GAMMA_MED),
+                scenario_rule=str(bo_cfg.scenario_rule),
+                rho_rule=str(bo_cfg.rho_rule),
+                rho_param=float(bo_cfg.rho_param),
+            )
+            st.success("Config bonds mise à jour ✅")
+        except Exception as e:
+            st.error(f"Erreur config bonds: {e}")
+
+
+### FILE: pages\5_🧮_Run_Results.py
+from __future__ import annotations
+
+import math
+from typing import Any, Dict, List, Optional
+
+import pandas as pd
+import streamlit as st
+
+from ui_common import (
+    apply_page_config,
+    apply_pro_css,
+    init_session_state,
+    pretty_capital_block,
+    run_engine,
+    save_run_history,
+)
+
+# (optionnel) pour afficher corr matrix de manière fidèle au modèle
+from girr import corr_matrix_for_tenors
+
+apply_page_config()
+apply_pro_css()
+init_session_state()
+
+# ---- petite couche CSS dédiée à cette page (cards/steps)
+st.markdown(
+    """
+<style>
+.step-card {
+  border: 1px solid rgba(255,255,255,0.10);
+  background: rgba(255,255,255,0.03);
+  padding: 14px 16px;
+  border-radius: 16px;
+  margin: 8px 0 12px 0;
+}
+.step-title { font-size: 1.05rem; font-weight: 650; margin-bottom: 6px; }
+.muted { opacity: .75; }
+.badge {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255,255,255,0.15);
+  background: rgba(255,255,255,0.05);
+  font-size: 0.85rem;
+  margin-left: 8px;
+}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+st.title("🧮 Run & Results")
+st.caption("Exécute FRTBEngine.run() et affiche les calculs étape par étape (Equity + GIRR Swaps + GIRR Bonds).")
+
+p = st.session_state["portfolio"]
+
+# -----------------------------
+# Controls (run)
+# -----------------------------
+c1, c2, c3 = st.columns(3)
+with c1:
+    verbose = st.checkbox("Verbose (capturer les prints)", value=True, key="rr_verbose")
+with c2:
+    use_override = st.checkbox(
+        "Appliquer bond_curves_override (demo_market)",
+        value=True,
+        key="rr_use_override",
+    )
+with c3:
+    show_logs_snippets = st.checkbox(
+        "Afficher extraits de logs dans les steps",
+        value=True,
+        key="rr_show_snippets",
+    )
+
+if st.button("▶️ Lancer le run", type="primary", use_container_width=True, key="rr_run_btn"):
+    try:
+        res, logs = run_engine(port=p, use_bond_override=use_override, verbose=verbose)
+        st.session_state["last_run"] = res
+        st.session_state["last_logs"] = logs
+        st.session_state["last_run_error"] = ""
+        st.success("Run terminé ✅")
+        run_id = save_run_history(
+            port=p,
+            res=res,
+            logs=logs,
+            use_bond_override=use_override,
+            verbose=verbose,
+            status="ok",
+            error_txt="",
+        )
+        if run_id is not None:
+            st.toast(f"Run enregistré (id={run_id})", icon="🗄️")
+
+    except Exception as e:
+        st.session_state["last_run"] = None
+        st.session_state["last_logs"] = ""
+        st.session_state["last_run_error"] = str(e)
+        st.error(f"Erreur run: {e}")
+        _ = save_run_history(
+            port=p,
+            res=None,
+            logs="",
+            use_bond_override=use_override,
+            verbose=verbose,
+            status="error",
+            error_txt=str(e),
+        )
+
+
+if st.session_state.get("last_run_error"):
+    st.error(st.session_state["last_run_error"])
+
+res = st.session_state.get("last_run")
+logs = st.session_state.get("last_logs", "")
+
+if res is None:
+    st.info("Aucun résultat pour l’instant. Cliquez sur **Lancer le run**.")
+    st.stop()
+
+st.divider()
+
+# -----------------------------
+# Summary metrics
+# -----------------------------
+cap = pretty_capital_block(res)
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Equity", cap["Equity"])
+m2.metric("GIRR Swaps", cap["GIRR Swaps"])
+m3.metric("GIRR Bonds", cap["GIRR Bonds"])
+m4.metric("Total (somme)", cap["Total (somme)"])
+
+st.divider()
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def _step_box(title: str, subtitle: Optional[str] = None):
+    st.markdown('<div class="step-card">', unsafe_allow_html=True)
+    st.markdown(f'<div class="step-title">{title}</div>', unsafe_allow_html=True)
+    if subtitle:
+        st.markdown(f'<div class="muted">{subtitle}</div>', unsafe_allow_html=True)
+
+
+def _step_box_end():
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def _extract_between(text: str, start: str, end: Optional[str] = None) -> str:
+    if not text:
+        return ""
+    i = text.find(start)
+    if i < 0:
+        return ""
+    j = text.find(end, i + len(start)) if end else -1
+    if j < 0:
+        return text[i:]
+    return text[i:j]
+
+
+def _worst_scenario(totals: Dict[str, float]) -> str:
+    if not totals:
+        return "—"
+    k = max(totals, key=lambda s: float(totals[s]))
+    return k.upper()
+
+
+def _df_money(df: pd.DataFrame, cols: List[str], nd: int = 2) -> pd.DataFrame:
+    out = df.copy()
+    for c in cols:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce").round(nd)
+    return out
+
+
+def _compute_girr_sens_from_ws(ws: Dict[str, Dict[float, float]], cfg, tenors: List[float]) -> Dict[str, Dict[float, float]]:
+    """
+    Reconstruit s_k approximativement via s_k = WS_k / RW_k,
+    en tenant compte de specified_currency_reduction (RW / sqrt(2)).
+    """
+    if not ws:
+        return {}
+    rw = dict(cfg.rw_by_tenor)
+    if cfg.specified_currency_reduction:
+        for T in list(rw.keys()):
+            rw[T] = rw[T] / math.sqrt(2.0)
+
+    sens: Dict[str, Dict[float, float]] = {}
+    for ccy, ws_ccy in ws.items():
+        sens[ccy] = {}
+        for T in tenors:
+            rwT = rw.get(float(T))
+            if rwT is None or abs(rwT) < 1e-18:
+                sens[ccy][float(T)] = 0.0
+            else:
+                sens[ccy][float(T)] = float(ws_ccy.get(T, 0.0)) / float(rwT)
+    return sens
+
+
+def _ws_table(ws: Dict[str, Dict[float, float]]) -> pd.DataFrame:
+    rows = []
+    for ccy, d in ws.items():
+        for T, v in d.items():
+            rows.append({"ccy": ccy, "tenor": float(T), "WS": float(v)})
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values(["ccy", "tenor"]).reset_index(drop=True)
+    return df
+
+
+def _plot_ws(ws: Dict[str, Dict[float, float]], title: str):
+    df = _ws_table(ws)
+    if df.empty:
+        st.info("Aucune WS à afficher.")
+        return
+    st.caption(title)
+    for ccy in sorted(df["ccy"].unique()):
+        d = df[df["ccy"] == ccy][["tenor", "WS"]].set_index("tenor")
+        st.line_chart(d, use_container_width=True)
+
+
+# -----------------------------
+# Tabs
+# -----------------------------
+tab_eq, tab_sw, tab_bo, tab_logs = st.tabs(["Equity (Steps)", "GIRR Swaps (Steps)", "GIRR Bonds (Steps)", "Logs (Raw)"])
+
+# =========================================================
+# EQUITY
+# =========================================================
+with tab_eq:
+    eq = res.get("equity", {}) or {}
+    totals = eq.get("totals", {}) or {}
+    worst = _worst_scenario(totals)
+
+    cA, cB = st.columns([1, 2])
+    with cA:
+        st.metric("K_final", f"{float(eq.get('K_final', 0.0)):,.2f}".replace(",", " "))
+        st.markdown(f'Worst scenario <span class="badge">{worst}</span>', unsafe_allow_html=True)
+    with cB:
+        if totals:
+            st.write("Totaux par scénario:")
+            st.dataframe(pd.DataFrame([totals]).rename_axis("scenario", axis=1), use_container_width=True)
+
+    st.divider()
+
+    # Step 1 — Pricing + Greeks (trade-level) => via logs
+    _step_box("① Pricing + Greeks (par trade)", "PV, d1/d2, s_spot, s_repo, VR (issu des logs).")
+    if show_logs_snippets and logs:
+        snippet = _extract_between(logs, "[1] Pricing + Greeks", "[2] DELTA (SBM)")
+        if snippet.strip():
+            st.code(snippet.strip(), language="text")
+        else:
+            st.info("Aucun extrait trouvé (peut arriver si verbose=False).")
+    else:
+        st.info("Activez 'Verbose' et relancez pour voir le détail par trade.")
+    _step_box_end()
+
+    # Step 2 — Delta (bucket + interbucket)
+    bd = eq.get("bucket_delta", {}) or {}
+    _step_box("② DELTA (SBM)", "Weighted Sensitivities (WS_spot/WS_repo), K_b (low/med/high) et agrégation inter-bucket.")
+    if bd:
+        df = pd.DataFrame(
+            [
+                {
+                    "bucket": int(b),
+                    "WS_spot": float(v.get("WS_spot", 0.0)),
+                    "WS_repo": float(v.get("WS_repo", 0.0)),
+                    "S_b": float(v.get("S", 0.0)),
+                    "K_low": float(v.get("K_low", 0.0)),
+                    "K_med": float(v.get("K_med", 0.0)),
+                    "K_high": float(v.get("K_high", 0.0)),
+                }
+                for b, v in bd.items()
+            ]
+        ).sort_values("bucket")
+        df = _df_money(df, ["WS_spot", "WS_repo", "S_b", "K_low", "K_med", "K_high"], nd=2)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+        # mini chart: WS by bucket
+        chart = df[["bucket", "WS_spot", "WS_repo"]].set_index("bucket")
+        st.caption("WS par bucket (spot/repo)")
+        st.bar_chart(chart, use_container_width=True)
+    else:
+        st.info("Pas de données delta.")
+    _step_box_end()
+
+    # Step 3 — Vega
+    bv = eq.get("bucket_vega", {}) or {}
+    _step_box("③ VEGA (SBM)", "VR par bucket, WS=RW*VR, K_b=|WS| et agrégation inter-bucket.")
+    if bv:
+        dfv = pd.DataFrame(
+            [{"bucket": int(b), "S": float(v.get("S", 0.0)), "K": float(v.get("K", 0.0))} for b, v in bv.items()]
+        ).sort_values("bucket")
+        dfv = _df_money(dfv, ["S", "K"], nd=2)
+        st.dataframe(dfv, use_container_width=True, hide_index=True)
+
+        st.caption("WS vega par bucket")
+        st.bar_chart(dfv[["bucket", "S"]].set_index("bucket"), use_container_width=True)
+    else:
+        st.info("Pas de données vega.")
+    _step_box_end()
+
+    # Step 4 — Curvature
+    bc = eq.get("bucket_curv", {}) or {}
+    _step_box("④ CURVATURE (SBM)", "K_b^curv par bucket puis agrégation inter-bucket (issu des logs).")
+    if bc:
+        dfc = pd.DataFrame([{"bucket": int(b), "K_curv": float(v)} for b, v in bc.items()]).sort_values("bucket")
+        dfc = _df_money(dfc, ["K_curv"], nd=2)
+        st.dataframe(dfc, use_container_width=True, hide_index=True)
+
+        st.caption("K_curv par bucket")
+        st.bar_chart(dfc.set_index("bucket"), use_container_width=True)
+    else:
+        st.info("Pas de données curvature.")
+    if show_logs_snippets and logs:
+        snippet = _extract_between(logs, "[4] CURVATURE (SBM)", "[5] Capital Equity final")
+        if snippet.strip():
+            with st.expander("Détail curvature (extrait des logs)", expanded=False):
+                st.code(snippet.strip(), language="text")
+    _step_box_end()
+
+    # Step 5 — Final
+    _step_box("⑤ Capital final Equity", "K_final = max( low, medium, high ).")
+    if totals:
+        dfT = pd.DataFrame([{"scenario": k, "K": float(v)} for k, v in totals.items()]).sort_values("K", ascending=False)
+        st.dataframe(_df_money(dfT, ["K"], nd=2), use_container_width=True, hide_index=True)
+    _step_box_end()
+
+# =========================================================
+# GIRR SWAPS
+# =========================================================
+with tab_sw:
+    sw = res.get("girr_swaps", {}) or {}
+    totals = sw.get("totals", {}) or {}
+    worst = _worst_scenario(totals)
+
+    cA, cB = st.columns([1, 2])
+    with cA:
+        st.metric("K_final", f"{float(sw.get('K_final', 0.0)):,.0f}".replace(",", " "))
+        st.markdown(f'Worst scenario <span class="badge">{worst}</span>', unsafe_allow_html=True)
+    with cB:
+        if totals:
+            st.write("Totaux par scénario:")
+            st.dataframe(pd.DataFrame([totals]).rename_axis("scenario", axis=1), use_container_width=True)
+
+    st.divider()
+
+    ws = sw.get("WS", {}) or {}
+    Kb = sw.get("Kb", {}) or {}
+    cfg_sw = st.session_state["girr_cfg_swaps"]
+    tenors = sorted(cfg_sw.rw_by_tenor.keys())
+
+    # Step 0 — Bump & Reprice (logs)
+    _step_box("⓪ Bump & Reprice (sensibilités)", "PV0 et mécanique bump (issu des logs).")
+    if show_logs_snippets and logs:
+        snippet = _extract_between(logs, "GIRR — Swaps — Delta (SBM)", "GIRR — Bonds — Delta (SBM)")
+        if snippet.strip():
+            st.code(snippet.strip(), language="text")
+        else:
+            st.info("Aucun extrait trouvé.")
+    else:
+        st.info("Activez 'Verbose' et relancez pour voir le détail bump&reprice.")
+    _step_box_end()
+
+    # Step 1 — Sensitivities (reconstruites)
+    _step_box("① s_k (reconstruites)", "On reconstruit s_k ≈ WS_k / RW_k .")
+    if ws:
+        sens = _compute_girr_sens_from_ws(ws, cfg_sw, tenors)
+        rows = []
+        for ccy, d in sens.items():
+            for T in tenors:
+                rows.append({"ccy": ccy, "tenor": float(T), "s_k": float(d.get(float(T), 0.0))})
+        df_s = pd.DataFrame(rows).sort_values(["ccy", "tenor"])
+        df_s["s_k"] = df_s["s_k"].round(2)
+        st.dataframe(df_s, use_container_width=True, hide_index=True)
+    else:
+        st.info("Pas de WS disponibles.")
+    _step_box_end()
+
+    # Step 2 — Weighted sensitivities
+    _step_box("② Weighted sensitivities WS_k", "WS_k = RW_k * s_k. ")
+    if ws:
+        _plot_ws(ws, "WS par tenor (par currency bucket)")
+    else:
+        st.info("Pas de WS.")
+    _step_box_end()
+
+    # Step 3 — Intra-bucket K_b
+    _step_box("③ Intra-bucket: K_b = sqrt(WS' ρ WS)", "ρ dépend de la règle (exp_absdiff ou basel_tenor) et du scénario.")
+    if Kb:
+        # tableau Kb par scénario
+        rows = []
+        for sc, d in Kb.items():
+            for ccy, val in d.items():
+                rows.append({"scenario": sc, "ccy": ccy, "K_b": float(val)})
+        df_kb = pd.DataFrame(rows).sort_values(["scenario", "ccy"])
+        df_kb["K_b"] = df_kb["K_b"].round(2)
+        st.dataframe(df_kb, use_container_width=True, hide_index=True)
+
+        # corr matrix viewer (optionnel, medium par défaut)
+        sc_choice = st.selectbox("Voir la matrice de corrélation ρ (scénario)", ["low", "medium", "high"], index=1, key="sw_corr_scenario")
+        ccy_choice = st.selectbox("Bucket (currency)", sorted(ws.keys()) if ws else ["—"], key="sw_corr_ccy")
+
+        if ws and ccy_choice in ws:
+            ten_nz = [float(T) for T in tenors if float(ws[ccy_choice].get(float(T), 0.0)) != 0.0]
+            if len(ten_nz) >= 2:
+                rho = corr_matrix_for_tenors(ten_nz, cfg_sw, scenario=sc_choice)
+                df_rho = pd.DataFrame(rho, index=[f"{t}Y" for t in ten_nz], columns=[f"{t}Y" for t in ten_nz])
+                with st.expander("Matrice ρ (tenors non-nuls)", expanded=False):
+                    st.dataframe(df_rho, use_container_width=True)
+            else:
+                st.info("Pas assez de tenors non-nuls pour afficher ρ (il en faut ≥ 2).")
+    else:
+        st.info("Pas de Kb.")
+    _step_box_end()
+
+    # Step 4 — Inter-bucket totals
+    _step_box("④ Inter-bucket: agrégation entre currencies", "K_total(scenario) = inter_bucket(Kb, S, gamma_scenario). K_final = max scénarios.")
+    if totals:
+        dfT = pd.DataFrame([{"scenario": k, "K_total": float(v)} for k, v in totals.items()]).sort_values("K_total", ascending=False)
+        dfT["K_total"] = dfT["K_total"].round(2)
+        st.dataframe(dfT, use_container_width=True, hide_index=True)
+    else:
+        st.info("Pas de totals.")
+    _step_box_end()
+
+# =========================================================
+# GIRR BONDS
+# =========================================================
+with tab_bo:
+    bo = res.get("girr_bonds", {}) or {}
+    totals = bo.get("totals", {}) or {}
+    worst = _worst_scenario(totals)
+
+    cA, cB = st.columns([1, 2])
+    with cA:
+        st.metric("K_final", f"{float(bo.get('K_final', 0.0)):,.0f}".replace(",", " "))
+        st.markdown(f'Worst scenario <span class="badge">{worst}</span>', unsafe_allow_html=True)
+    with cB:
+        if totals:
+            st.write("Totaux par scénario:")
+            st.dataframe(pd.DataFrame([totals]).rename_axis("scenario", axis=1), use_container_width=True)
+
+    st.divider()
+
+    ws = bo.get("WS", {}) or {}
+    Kb = bo.get("Kb", {}) or {}
+    cfg_bo = st.session_state["girr_cfg_bonds"]
+    tenors = sorted(cfg_bo.rw_by_tenor.keys())
+
+    _step_box("⓪ Bump & Reprice (sensibilités)", "PV0 et bump (détail trade-level dans les logs).")
+    if show_logs_snippets and logs:
+        snippet = _extract_between(logs, "GIRR — Bonds — Delta (SBM)", "RÉSUMÉ (par risk class)")
+        if snippet.strip():
+            st.code(snippet.strip(), language="text")
+        else:
+            st.info("Aucun extrait trouvé.")
+    else:
+        st.info("Activez 'Verbose' et relancez pour voir le détail bump&reprice.")
+    _step_box_end()
+
+    _step_box("① s_k (reconstruites)", "On reconstruit s_k ≈ WS_k / RW_k pour visualiser.")
+    if ws:
+        sens = _compute_girr_sens_from_ws(ws, cfg_bo, tenors)
+        rows = []
+        for ccy, d in sens.items():
+            for T in tenors:
+                rows.append({"ccy": ccy, "tenor": float(T), "s_k": float(d.get(float(T), 0.0))})
+        df_s = pd.DataFrame(rows).sort_values(["ccy", "tenor"])
+        df_s["s_k"] = df_s["s_k"].round(2)
+        st.dataframe(df_s, use_container_width=True, hide_index=True)
+    else:
+        st.info("Pas de WS.")
+    _step_box_end()
+
+    _step_box("② Weighted sensitivities WS_k", "WS_k = RW_k * s_k.")
+    if ws:
+        _plot_ws(ws, "WS par tenor (par currency bucket)")
+    else:
+        st.info("Pas de WS.")
+    _step_box_end()
+
+    _step_box("③ Intra-bucket: K_b = sqrt(WS' ρ WS)", "Affiche K_b par scénario + matrice ρ optionnelle.")
+    if Kb:
+        rows = []
+        for sc, d in Kb.items():
+            for ccy, val in d.items():
+                rows.append({"scenario": sc, "ccy": ccy, "K_b": float(val)})
+        df_kb = pd.DataFrame(rows).sort_values(["scenario", "ccy"])
+        df_kb["K_b"] = df_kb["K_b"].round(2)
+        st.dataframe(df_kb, use_container_width=True, hide_index=True)
+
+        sc_choice = st.selectbox("Voir la matrice de corrélation ρ (scénario)", ["low", "medium", "high"], index=1, key="bo_corr_scenario")
+        ccy_choice = st.selectbox("Bucket (currency)", sorted(ws.keys()) if ws else ["—"], key="bo_corr_ccy")
+
+        if ws and ccy_choice in ws:
+            ten_nz = [float(T) for T in tenors if float(ws[ccy_choice].get(float(T), 0.0)) != 0.0]
+            if len(ten_nz) >= 2:
+                rho = corr_matrix_for_tenors(ten_nz, cfg_bo, scenario=sc_choice)
+                df_rho = pd.DataFrame(rho, index=[f"{t}Y" for t in ten_nz], columns=[f"{t}Y" for t in ten_nz])
+                with st.expander("Matrice ρ (tenors non-nuls)", expanded=False):
+                    st.dataframe(df_rho, use_container_width=True)
+            else:
+                st.info("Pas assez de tenors non-nuls pour afficher ρ (il en faut ≥ 2).")
+    else:
+        st.info("Pas de Kb.")
+    _step_box_end()
+
+    _step_box("④ Inter-bucket: agrégation entre currencies", "K_final = max scénarios.")
+    if totals:
+        dfT = pd.DataFrame([{"scenario": k, "K_total": float(v)} for k, v in totals.items()]).sort_values("K_total", ascending=False)
+        dfT["K_total"] = dfT["K_total"].round(2)
+        st.dataframe(dfT, use_container_width=True, hide_index=True)
+    else:
+        st.info("Pas de totals.")
+    _step_box_end()
+
+# =========================================================
+# RAW LOGS
+# =========================================================
+with tab_logs:
+    if logs:
+        st.code(logs, language="text")
+    else:
+        st.info("Pas de logs (verbose=False).")
+
+
+### FILE: pages\6_📤_Export.py
+from __future__ import annotations
+
+import streamlit as st
+
+from ui_common import (
+    apply_page_config,
+    apply_pro_css,
+    init_session_state,
+    portfolio_to_csv,
+    results_to_json,
+)
+
+apply_page_config()
+apply_pro_css()
+init_session_state()
+
+st.title("📤 Export")
+st.caption("Téléchargement du portfolio + résultats (JSON) + logs.")
+
+p = st.session_state["portfolio"]
+res = st.session_state.get("last_run")
+logs = st.session_state.get("last_logs", "")
+
+c1, c2 = st.columns(2)
+with c1:
+    st.download_button(
+        "⬇️ Portfolio (CSV)",
+        data=portfolio_to_csv(p),
+        file_name="portfolio.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+with c2:
+    if res is None:
+        st.download_button(
+            "⬇️ Résultats (JSON)",
+            data="{}",
+            file_name="results.json",
+            mime="application/json",
+            use_container_width=True,
+            disabled=True,
+        )
+    else:
+        st.download_button(
+            "⬇️ Résultats (JSON)",
+            data=results_to_json(res),
+            file_name="results.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
+st.divider()
+
+st.download_button(
+    "⬇️ Logs (txt)",
+    data=logs or "",
+    file_name="run_logs.txt",
+    mime="text/plain",
+    use_container_width=True,
+)
+
+
+### FILE: pages\7_🕘_Historique.py
+from __future__ import annotations
+
+import ast
+import io
+import json
+import zipfile
+from typing import Any, Dict, Optional, Tuple
+
+import pandas as pd
+import streamlit as st
+
+from curves import ZeroCurve
+from equity import EquityConfig
+from girr import GirrConfig
+from history_db import clear_all, delete_run, get_run, init_db, list_runs
+from market import Market
+from portfolio import BondTrade, EquityCallTrade, Portfolio, SwapTrade
+from ui_common import apply_page_config, apply_pro_css, init_session_state
+
+apply_page_config()
+apply_pro_css()
+init_session_state()
+init_db()
+
+st.title("🕘 Historique")
+st.caption("Historique des runs enregistrés en base SQLite (KPIs + snapshots + outputs téléchargeables).")
+
+
+# =========================================================
+# Helpers — restore
+# =========================================================
+def _parse_fx_key(k: Any) -> Optional[Tuple[str, str]]:
+    """
+    Accepte:
+      - tuple/list ("USD","EUR")
+      - string "('USD','EUR')" (cas actuel via to_jsonable)
+      - string "USD->EUR", "USD/EUR", "USD,EUR"
+    """
+    if isinstance(k, (tuple, list)) and len(k) == 2:
+        return (str(k[0]).strip().upper(), str(k[1]).strip().upper())
+
+    if not isinstance(k, str):
+        return None
+
+    s = k.strip()
+
+    # cas "('USD', 'EUR')"
+    if s.startswith("(") and s.endswith(")"):
+        try:
+            t = ast.literal_eval(s)
+            if isinstance(t, tuple) and len(t) == 2:
+                return (str(t[0]).strip().upper(), str(t[1]).strip().upper())
+        except Exception:
+            pass
+
+    # fallback séparateurs
+    for sep in ["->", "/", ",", "|"]:
+        if sep in s:
+            a, b = s.replace(" ", "").split(sep, 1)
+            if a and b:
+                return (a.upper(), b.upper())
+
+    return None
+
+
+def _restore_zero_curve(d: Dict[str, Any]) -> ZeroCurve:
+    ten = d.get("tenors", d.get("tenor", d.get("T", [])))
+    z = d.get("zeros", d.get("zero", d.get("Z", [])))
+    ten_t = tuple(float(x) for x in ten)
+    z_t = tuple(float(x) for x in z)
+    return ZeroCurve(ten_t, z_t)
+
+
+def _restore_market(d: Dict[str, Any]) -> Market:
+    reporting_ccy = str(d.get("reporting_ccy", "EUR")).strip().upper()
+
+    fx_in = d.get("fx", {}) or {}
+    fx: Dict[Tuple[str, str], float] = {}
+    if isinstance(fx_in, dict):
+        for k, v in fx_in.items():
+            kk = _parse_fx_key(k)
+            if kk is None:
+                continue
+            fx[kk] = float(v)
+
+    curves_in = d.get("curves", {}) or {}
+    curves: Dict[str, ZeroCurve] = {}
+    if isinstance(curves_in, dict):
+        for ccy, cd in curves_in.items():
+            curves[str(ccy).strip().upper()] = _restore_zero_curve(cd)
+
+    return Market(reporting_ccy=reporting_ccy, fx=fx, curves=curves)
+
+
+def _restore_portfolio(d: Dict[str, Any]) -> Portfolio:
+    eq_rows = d.get("equity_calls", []) or []
+    sw_rows = d.get("girr_swaps", []) or []
+    bo_rows = d.get("girr_bonds", []) or []
+
+    eq = []
+    for r in eq_rows:
+        if not isinstance(r, dict):
+            continue
+        eq.append(
+            EquityCallTrade(
+                name=str(r["name"]),
+                bucket=int(r["bucket"]),
+                N=float(r["N"]),
+                S0=float(r["S0"]),
+                K=float(r["K"]),
+                T=float(r["T"]),
+                r=float(r["r"]),
+                q_repo=float(r["q_repo"]),
+                sigma=float(r["sigma"]),
+            )
+        )
+
+    sw = []
+    for r in sw_rows:
+        if not isinstance(r, dict):
+            continue
+        sw.append(
+            SwapTrade(
+                name=str(r["name"]),
+                ccy=str(r["ccy"]).strip().upper(),
+                notional=float(r["notional"]),
+                maturity=int(r["maturity"]),
+                receive_fixed=bool(r["receive_fixed"]),
+            )
+        )
+
+    bo = []
+    for r in bo_rows:
+        if not isinstance(r, dict):
+            continue
+        bo.append(
+            BondTrade(
+                name=str(r["name"]),
+                ccy=str(r["ccy"]).strip().upper(),
+                notional=float(r["notional"]),
+                coupon_rate=float(r["coupon_rate"]),
+                maturity=int(r["maturity"]),
+            )
+        )
+
+    return Portfolio(eq, sw, bo)
+
+
+def _restore_equity_cfg(d: Dict[str, Any]) -> EquityConfig:
+    delta_rw_in = d.get("delta_rw", {}) or {}
+    delta_rw: Dict[int, Dict[str, float]] = {}
+    if isinstance(delta_rw_in, dict):
+        for bk, val in delta_rw_in.items():
+            b = int(bk)  # clés potentiellement string
+            delta_rw[b] = {
+                "spot": float(val.get("spot", 0.0)),
+                "repo": float(val.get("repo", 0.0)),
+                "curv": float(val.get("curv", 0.0)),
+            }
+
+    return EquityConfig(
+        delta_rw=delta_rw,
+        rho_spot_repo_med=float(d.get("rho_spot_repo_med", 0.0)),
+        gamma_inter_bucket_med=float(d.get("gamma_inter_bucket_med", 0.0)),
+        rw_vega=float(d.get("rw_vega", 0.0)),
+    )
+
+
+def _restore_girr_cfg(d: Dict[str, Any]) -> GirrConfig:
+    rw_in = d.get("rw_by_tenor", {}) or {}
+    rw: Dict[float, float] = {}
+    if isinstance(rw_in, dict):
+        for tk, v in rw_in.items():
+            rw[float(tk)] = float(v)
+
+    return GirrConfig(
+        rw_by_tenor=rw,
+        specified_currency_reduction=bool(d.get("specified_currency_reduction", False)),
+        bump_bp=float(d.get("bump_bp", 1e-4)),
+        gamma_inter_ccy_med=float(d.get("gamma_inter_ccy_med", 0.0)),
+        scenario_rule=str(d.get("scenario_rule", "lowmedhigh")),
+        rho_rule=str(d.get("rho_rule", "exp_absdiff")),
+        rho_param=float(d.get("rho_param", 0.0)),
+    )
+
+
+def _restore_bond_override(x: Any) -> Optional[Tuple[Tuple[float, ...], Tuple[float, ...], Tuple[float, ...]]]:
+    """
+    snapshot["bond_override"] est soit None, soit une liste de 3 listes:
+      [tenors, z_eur_bond, z_usd_bond]
+    On renvoie (tuple(tenors), tuple(z_eur), tuple(z_usd))
+    """
+    if x is None:
+        return None
+    if not isinstance(x, (list, tuple)) or len(x) != 3:
+        return None
+    ten = tuple(float(v) for v in x[0])
+    z1 = tuple(float(v) for v in x[1])
+    z2 = tuple(float(v) for v in x[2])
+    return (ten, z1, z2)
+
+
+def restore_session_from_snapshot(snapshot_json: str) -> Tuple[bool, str]:
+    try:
+        snap = json.loads(snapshot_json or "{}")
+        if not isinstance(snap, dict):
+            return False, "Snapshot invalide (pas un objet JSON)."
+
+        # 1) Portfolio
+        if "portfolio" in snap:
+            st.session_state["portfolio"] = _restore_portfolio(snap["portfolio"])
+
+        # 2) Market
+        if "market" in snap:
+            st.session_state["market"] = _restore_market(snap["market"])
+
+        # 3) Configs
+        if "equity_cfg" in snap:
+            st.session_state["equity_cfg"] = _restore_equity_cfg(snap["equity_cfg"])
+        if "girr_cfg_swaps" in snap:
+            st.session_state["girr_cfg_swaps"] = _restore_girr_cfg(snap["girr_cfg_swaps"])
+        if "girr_cfg_bonds" in snap:
+            st.session_state["girr_cfg_bonds"] = _restore_girr_cfg(snap["girr_cfg_bonds"])
+
+        # 4) Bond override (si présent)
+        if "bond_override" in snap:
+            bo = _restore_bond_override(snap.get("bond_override"))
+            if bo is not None:
+                st.session_state["bond_override"] = bo
+
+        # 5) Reset résultats (évite confusion)
+        st.session_state["last_run"] = None
+        st.session_state["last_logs"] = ""
+        st.session_state["last_run_error"] = ""
+
+        return True, "Session restaurée (portfolio + market + configs)."
+    except Exception as e:
+        return False, f"Impossible de restaurer: {e}"
+
+
+# =========================================================
+# Filters
+# =========================================================
+c1, c2, c3 = st.columns([1, 1, 2])
+with c1:
+    status = st.selectbox("Filtre status", ["Tous", "ok", "error"], index=0, key="hist_status")
+with c2:
+    limit = st.slider("Nombre de runs", min_value=20, max_value=500, value=200, step=20, key="hist_limit")
+with c3:
+    st.write("")
+
+status_db = None if status == "Tous" else status
+runs = list_runs(limit=int(limit), status=status_db)
+
+if not runs:
+    st.info("Aucun run dans l’historique pour l’instant. Lancez un run dans **Run & Results**.")
+    st.stop()
+
+df = pd.DataFrame(runs)
+for c in ["k_eq", "k_sw", "k_bo", "k_total"]:
+    if c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce").round(2)
+
+ok_n = int((df["status"] == "ok").sum()) if "status" in df.columns else 0
+err_n = int((df["status"] == "error").sum()) if "status" in df.columns else 0
+last_ts = str(df.iloc[0]["created_at_local"]) if len(df) else "—"
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Runs (filtrés)", f"{len(df)}")
+m2.metric("OK", f"{ok_n}")
+m3.metric("Errors", f"{err_n}")
+m4.metric("Dernier run", last_ts)
+
+with st.expander("Voir la table des runs", expanded=False):
+    show = df[["id", "created_at_local", "status", "k_eq", "k_sw", "k_bo", "k_total"]].copy()
+    show = show.rename(
+        columns={
+            "created_at_local": "time",
+            "k_eq": "K_eq",
+            "k_sw": "K_sw",
+            "k_bo": "K_bo",
+            "k_total": "K_total",
+        }
+    )
+    st.dataframe(show, use_container_width=True, hide_index=True)
+
+labels = [
+    f"#{int(r['id'])} | {r['created_at_local']} | {r['status']} | Total={float(r.get('k_total') or 0.0):,.2f}".replace(",", " ")
+    for r in runs
+]
+sel = st.selectbox("Sélectionner un run", options=list(range(len(runs))), format_func=lambda i: labels[i], key="hist_select")
+run_id = int(runs[sel]["id"])
+
+rec = get_run(run_id)
+if not rec:
+    st.error("Run introuvable (il a peut-être été supprimé).")
+    st.stop()
+
+st.divider()
+
+# =========================================================
+# Run details + Restore button
+# =========================================================
+left, right = st.columns([1, 2])
+
+with left:
+    st.subheader(f"Run #{run_id}")
+    st.write(f"**Time (local)**: {rec.get('created_at_local')}")
+    st.write(f"**Status**: `{rec.get('status')}`")
+
+    st.metric("K_eq", f"{float(rec.get('k_eq') or 0.0):,.2f}".replace(",", " "))
+    st.metric("K_sw", f"{float(rec.get('k_sw') or 0.0):,.2f}".replace(",", " "))
+    st.metric("K_bo", f"{float(rec.get('k_bo') or 0.0):,.2f}".replace(",", " "))
+    st.metric("K_total", f"{float(rec.get('k_total') or 0.0):,.2f}".replace(",", " "))
+
+    if rec.get("error_txt"):
+        st.error(rec["error_txt"])
+
+    st.divider()
+
+    # ✅ Restore button
+    if st.button("♻️ Restaurer ce run (portfolio + market + configs)", type="primary", use_container_width=True, key="hist_restore_btn"):
+        ok, msg = restore_session_from_snapshot(rec.get("snapshot_json") or "{}")
+        if ok:
+            st.success(msg)
+            st.toast("Vous pouvez maintenant aller dans Portfolio / Market / Configs.", icon="✅")
+            st.rerun()
+        else:
+            st.error(msg)
+
+with right:
+    st.subheader("Téléchargements")
+
+    portfolio_csv = rec.get("portfolio_csv") or ""
+    snapshot_json = rec.get("snapshot_json") or "{}"
+    results_json = rec.get("results_json") or "{}"
+    logs_txt = rec.get("logs_txt") or ""
+
+    cA, cB, cC, cD = st.columns(4)
+    cA.download_button("⬇️ portfolio.csv", data=portfolio_csv, file_name=f"run_{run_id}_portfolio.csv", mime="text/csv", use_container_width=True)
+    cB.download_button("⬇️ snapshot.json", data=snapshot_json, file_name=f"run_{run_id}_snapshot.json", mime="application/json", use_container_width=True)
+    cC.download_button("⬇️ results.json", data=results_json, file_name=f"run_{run_id}_results.json", mime="application/json", use_container_width=True)
+    cD.download_button("⬇️ logs.txt", data=logs_txt, file_name=f"run_{run_id}_logs.txt", mime="text/plain", use_container_width=True)
+
+    zbuf = io.BytesIO()
+    with zipfile.ZipFile(zbuf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr("portfolio.csv", portfolio_csv)
+        z.writestr("snapshot.json", snapshot_json)
+        z.writestr("results.json", results_json)
+        z.writestr("logs.txt", logs_txt)
+    zbuf.seek(0)
+
+    st.download_button(
+        "⬇️ Tout télécharger (zip)",
+        data=zbuf.getvalue(),
+        file_name=f"run_{run_id}_all.zip",
+        mime="application/zip",
+        use_container_width=True,
+    )
+
+st.divider()
+
+# =========================================================
+# Viewers
+# =========================================================
+tab1, tab2, tab3 = st.tabs(["Snapshot", "Results", "Logs"])
+
+with tab1:
+    try:
+        st.json(json.loads(rec.get("snapshot_json") or "{}"), expanded=False)
+    except Exception:
+        st.code(rec.get("snapshot_json") or "{}", language="json")
+
+with tab2:
+    try:
+        st.json(json.loads(rec.get("results_json") or "{}"), expanded=False)
+    except Exception:
+        st.code(rec.get("results_json") or "{}", language="json")
+
+with tab3:
+    if rec.get("logs_txt"):
+        st.code(rec["logs_txt"], language="text")
+    else:
+        st.info("Pas de logs enregistrés pour ce run.")
+
+st.divider()
+
+# =========================================================
+# Delete / clear
+# =========================================================
+c1, c2 = st.columns(2)
+
+with c1:
+    if st.button("🗑️ Supprimer ce run", use_container_width=True, key="hist_delete_one"):
+        delete_run(run_id)
+        st.success(f"Run #{run_id} supprimé.")
+        st.rerun()
+
+with c2:
+    confirm = st.checkbox("Je confirme la suppression de tout l’historique", key="hist_confirm_clear")
+    if st.button("🔥 Tout supprimer", use_container_width=True, disabled=not confirm, key="hist_clear_all"):
+        clear_all()
+        st.success("Historique supprimé.")
+        st.rerun()
+
+
+### FILE: pages\8_🧾_Documentation.py
+# pages/8_🧾_Documentation.py
+from __future__ import annotations
+
+import json
+import os
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import streamlit as st
+
+from ui_common import apply_page_config, apply_pro_css, init_session_state
+
+try:
+    from pages.code_docs import render_doc_panel as _render_doc_panel_manual
+    _DOC_IMPORT_ERROR = None
+except Exception as e:
+    _render_doc_panel_manual = None
+    _DOC_IMPORT_ERROR = repr(e)
+
+apply_page_config()
+apply_pro_css()
+init_session_state()
+
+ROOT = Path(__file__).resolve().parents[1]  # .../pages -> project root
+DOCS_REGISTRY_PATH = ROOT / "pages" / "docs_registry.json"
+
+EXCLUDE_PROJECT = {
+    ".git",
+    "venv",
+    ".venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".streamlit_app_cache",
+    ".idea",
+    ".vscode",
+    "dist",
+    "build",
+}
+
+TEXT_EXTS = {
+    ".py": "python",
+    ".ipynb": "ipynb",
+    ".md": "markdown",
+    ".txt": "text",
+    ".json": "json",
+    ".yaml": "yaml",
+    ".yml": "yaml",
+    ".toml": "toml",
+    ".ini": "ini",
+    ".cfg": "ini",
+    ".csv": "csv",
+    ".log": "text",
+}
+
+MAX_PREVIEW_BYTES = 1_200_000  # ~1.2MB
+
+
+# =============================================================================
+# Utils
+# =============================================================================
+def _fmt_bytes(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n/1024:.1f} KB"
+    return f"{n/(1024*1024):.2f} MB"
+
+
+def _fmt_dt(ts: float) -> str:
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _read_text_safely(path: Path, max_bytes: int = MAX_PREVIEW_BYTES) -> Tuple[str, bool]:
+    b = path.read_bytes()
+    truncated = False
+    if len(b) > max_bytes:
+        b = b[:max_bytes]
+        truncated = True
+    text = b.decode("utf-8", errors="replace")
+    return text, truncated
+
+
+def _language_for(path: Path) -> str:
+    ext = path.suffix.lower()
+    if ext == ".ipynb":
+        return "json"
+    return TEXT_EXTS.get(ext, "text")
+
+
+# =============================================================================
+# Cached scanners
+# =============================================================================
+@st.cache_data(show_spinner=False)
+def _scan_files_project(root: str) -> List[Dict[str, Any]]:
+    root_p = Path(root)
+    out: List[Dict[str, Any]] = []
+
+    for dirpath, dirnames, filenames in os.walk(root_p):
+        dirnames[:] = [d for d in dirnames if d not in EXCLUDE_PROJECT]
+
+        for fn in filenames:
+            p = Path(dirpath) / fn
+            ext = p.suffix.lower()
+            if ext not in TEXT_EXTS:
+                continue
+
+            try:
+                stt = p.stat()
+                size = int(stt.st_size)
+                mtime = float(stt.st_mtime)
+            except OSError:
+                continue
+
+            rel = p.relative_to(root_p).as_posix()
+            folder = str(Path(rel).parent).replace("\\", "/")
+            if folder == ".":
+                folder = ""
+
+            n_lines: Optional[int] = None
+            if ext != ".ipynb" and size <= 400_000:
+                try:
+                    txt = p.read_text(encoding="utf-8", errors="ignore")
+                    n_lines = txt.count("\n") + 1 if txt else 0
+                except Exception:
+                    n_lines = None
+
+            out.append(
+                {
+                    "rel": rel,
+                    "path": str(p),
+                    "ext": ext,
+                    "folder": folder,
+                    "size": size,
+                    "mtime": mtime,
+                    "lines": n_lines,
+                }
+            )
+
+    out.sort(key=lambda d: d["rel"])
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def _load_docs_registry(path: str) -> Dict[str, Any]:
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+# =============================================================================
+# Notebook renderer (simple)
+# =============================================================================
+def _render_notebook(path: Path) -> None:
+    raw, truncated = _read_text_safely(path)
+    if truncated:
+        st.warning(
+            f"Notebook volumineux : preview tronquée à {_fmt_bytes(MAX_PREVIEW_BYTES)}. "
+            "Tu peux le télécharger pour l’ouvrir complet.",
+            icon="⚠️",
+        )
+
+    try:
+        nb = json.loads(raw)
+    except Exception:
+        st.error("Impossible de parser ce .ipynb (JSON invalide).", icon="❌")
+        st.code(raw, language="json")
+        return
+
+    cells = nb.get("cells", [])
+    if not isinstance(cells, list):
+        st.error("Format .ipynb inattendu (cells manquant).", icon="❌")
+        st.code(raw, language="json")
+        return
+
+    show_outputs = st.checkbox("Afficher outputs", value=False, key="doc_show_nb_outputs")
+    st.divider()
+
+    for i, cell in enumerate(cells, start=1):
+        cell_type = cell.get("cell_type", "")
+        src = cell.get("source", "")
+
+        if isinstance(src, list):
+            src_text = "".join(src)
+        else:
+            src_text = str(src)
+
+        if cell_type == "markdown":
+            if src_text.strip():
+                st.markdown(src_text)
+        elif cell_type == "code":
+            st.markdown(f"**In [{i}]**")
+            st.code(src_text, language="python")
+
+            if show_outputs:
+                outs = cell.get("outputs", [])
+                if isinstance(outs, list) and outs:
+                    for out in outs:
+                        otype = out.get("output_type", "")
+                        if otype == "stream":
+                            txt = out.get("text", "")
+                            if isinstance(txt, list):
+                                txt = "".join(txt)
+                            st.code(str(txt), language="text")
+                        elif otype in ("execute_result", "display_data"):
+                            data = out.get("data", {})
+                            txt = None
+                            if isinstance(data, dict):
+                                txt = data.get("text/plain", None)
+                            if txt is not None:
+                                if isinstance(txt, list):
+                                    txt = "".join(txt)
+                                st.code(str(txt), language="text")
+                        elif otype == "error":
+                            tb = out.get("traceback", [])
+                            if isinstance(tb, list):
+                                st.code("\n".join(tb), language="text")
+
+
+# =============================================================================
+# UI
+# =============================================================================
+st.title("🧾 Documentation du code")
+st.caption("Preview + documentation manuelle (docs_registry.json).")
+
+if _render_doc_panel_manual is None:
+    st.error(
+        "Documentation manuelle indisponible : impossible d’importer `pages/code_docs.py`.\n\n"
+        f"Erreur: `{_DOC_IMPORT_ERROR}`",
+        icon="❌",
+    )
+    st.stop()
+
+docs_registry = _load_docs_registry(str(DOCS_REGISTRY_PATH))
+if not docs_registry:
+    st.warning(f"`docs_registry.json` introuvable ou vide: {DOCS_REGISTRY_PATH}", icon="⚠️")
+    st.stop()
+
+allowed_rels = set(docs_registry.keys())
+
+all_files = _scan_files_project(str(ROOT))
+files = [d for d in all_files if d["rel"] in allowed_rels]
+files.sort(key=lambda d: d["rel"])
+
+if not files:
+    st.warning(
+        "Aucun fichier du projet ne correspond aux chemins listés dans docs_registry.json.\n\n"
+        "Vérifie que les clés (ex: `pages/..`, `girr.py`, etc.) sont bien des chemins relatifs au root du projet.",
+        icon="⚠️",
+    )
+    st.stop()
+
+rels = [d["rel"] for d in files]
+
+# Selection state + navigation
+if "doc_choice" not in st.session_state:
+    st.session_state["doc_choice"] = rels[0]
+if st.session_state["doc_choice"] not in rels:
+    st.session_state["doc_choice"] = rels[0]
+
+nav1, nav2, nav3, nav4 = st.columns([0.18, 0.18, 1.0, 0.28], gap="small")
+with nav1:
+    if st.button("⬅️ Prev", use_container_width=True, key="doc_prev"):
+        i = rels.index(st.session_state["doc_choice"])
+        st.session_state["doc_choice"] = rels[max(0, i - 1)]
+with nav2:
+    if st.button("Next ➡️", use_container_width=True, key="doc_next"):
+        i = rels.index(st.session_state["doc_choice"])
+        st.session_state["doc_choice"] = rels[min(len(rels) - 1, i + 1)]
+with nav4:
+    st.caption(f"{rels.index(st.session_state['doc_choice']) + 1} / {len(rels)}")
+
+choice = st.selectbox(
+    "Select file",
+    rels,
+    index=rels.index(st.session_state["doc_choice"]),
+    key="doc_select",
+)
+st.session_state["doc_choice"] = choice
+
+path = ROOT / choice
+meta = next(d for d in files if d["rel"] == choice)
+
+st.write(f"**{choice}**")
+st.caption(
+    f"Ext: `{meta['ext']}`  |  Size: {_fmt_bytes(meta['size'])}  |  Modified: {_fmt_dt(meta['mtime'])}"
+    + (f"  |  Lines: {meta['lines']}" if meta.get("lines") is not None else "")
+)
+
+try:
+    file_bytes = path.read_bytes()
+    st.download_button(
+        "⬇️ Télécharger ce fichier",
+        data=file_bytes,
+        file_name=path.name,
+        mime="text/plain",
+        use_container_width=False,
+        key="doc_dl",
+    )
+except Exception:
+    st.warning("Impossible de préparer le téléchargement (droits/IO).", icon="⚠️")
+
+left, right = st.columns([1.35, 0.85], gap="large")
+ext = path.suffix.lower()
+
+with left:
+    st.subheader("Preview")
+
+    if ext == ".ipynb":
+        view_mode = st.radio(
+            "Notebook view",
+            ["Rendered", "Raw JSON"],
+            horizontal=True,
+            index=0,
+            key="doc_nb_view",
+        )
+        if view_mode == "Rendered":
+            _render_notebook(path)
+        else:
+            raw, truncated = _read_text_safely(path)
+            if truncated:
+                st.warning(f"Preview tronquée à {_fmt_bytes(MAX_PREVIEW_BYTES)}.", icon="⚠️")
+            st.code(raw, language="json")
+    else:
+        try:
+            content, truncated = _read_text_safely(path)
+            if truncated:
+                st.warning(f"Preview tronquée à {_fmt_bytes(MAX_PREVIEW_BYTES)}.", icon="⚠️")
+            st.code(content, language=_language_for(path))
+        except Exception as e:
+            st.error(f"Erreur de lecture : {e}", icon="❌")
+
+with right:
+    _render_doc_panel_manual(choice, path)
+
+
+### FILE: pages\code_docs.py
+# pages/code_docs.py
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+import streamlit as st
+
+ROOT = Path(__file__).resolve().parents[1]  # project root
+REGISTRY_PATH = ROOT / "pages" / "docs_registry.json"
+
+
+def load_docs_registry() -> Dict[str, Any]:
+    """Loads manual docs registry (JSON) keyed by file relpath."""
+    @st.cache_data(show_spinner=False)
+    def _load(p: str) -> Dict[str, Any]:
+        path = Path(p)
+        if not path.exists():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    return _load(str(REGISTRY_PATH))
+
+
+def manual_doc_for(relpath: str) -> Optional[Dict[str, Any]]:
+    reg = load_docs_registry()
+    d = reg.get(relpath, None)
+    return d if isinstance(d, dict) else None
+
+
+def render_doc_panel(relpath: str, path: Path) -> None:
+    """Right-hand panel: manual docs only (no auto-doc / AST)."""
+    st.subheader("Documentation")
+
+    manual = manual_doc_for(relpath)
+    if manual is None:
+        st.info(
+            "Pas de fiche manuelle pour ce fichier. "
+            "Ajoute une entrée dans `pages/docs_registry.json` pour l’afficher ici.",
+            icon="ℹ️",
+        )
+        return
+
+    title = manual.get("title", relpath)
+    tags = manual.get("tags", [])
+    summary = manual.get("summary", "")
+    usage = manual.get("usage", "")
+    notes = manual.get("notes", "")
+
+    st.markdown(f"### {title}")
+    if tags:
+        st.caption(" • ".join([f"`{t}`" for t in tags]))
+
+    if summary:
+        st.markdown(summary)
+
+    if usage:
+        st.markdown("#### Usage")
+        st.markdown(usage)
+
+    if notes:
+        st.markdown("#### Notes")
+        st.markdown(notes)
+
+
