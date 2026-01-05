@@ -7,7 +7,7 @@ Dashboard Streamlit multi-pages qui expose un **mini moteur FRTB SA / SBM** :
 - **Export** : portfolio/results/logs
 - **Historique** : runs persistés en **SQLite** (snapshot + KPIs + outputs)
 
-> ⚠️ Projet pédagogique / démo : paramètres, mappings et market “demo” ne sont pas une implémentation complète du texte réglementaire.
+> ⚠️ Projet à but illustratif : paramètres, mappings et market “demo” ne sont pas une implémentation complète du texte réglementaire.
 
 ---
 
