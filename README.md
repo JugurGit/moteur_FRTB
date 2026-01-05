@@ -14,5 +14,32 @@ Dashboard Streamlit multi-pages qui expose un **mini moteur FRTB SA / SBM** :
 ## 1) Prérequis
 
 - **Python 3.10+** (recommandé)
-- `pip` (ou `pipx`, `conda` si tu préfères)
-- (Optionnel) `git`
+
+## 2) Structure
+
+├── app.py
+├── main.py
+├── ui_common.py
+├── history_db.py
+├── curves.py
+├── market.py
+├── portfolio.py
+├── equity.py
+├── girr.py
+├── engine.py
+├── demo.py
+├── export_projet.py
+├── frtb_history.sqlite3            # généré automatiquement après un run (local)
+├── pages/
+│   ├── 1_🏠_Overview.py
+│   ├── 2_📦_Portfolio.py
+│   ├── 3_📈_Market.py
+│   ├── 4_⚙️_Configs.py
+│   ├── 5_🧮_Run_Results.py
+│   ├── 6_📤_Export.py
+│   ├── 7_🕘_Historique.py
+│   ├── 8_🧾_Documentation.py
+│   ├── code_docs.py
+│   └── docs_registry.json
+└── .streamlit/
+    └── config.toml
