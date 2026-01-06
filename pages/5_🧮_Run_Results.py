@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import streamlit as st
+import traceback
+
 
 from ui_common import (
     apply_page_config,
@@ -93,10 +95,15 @@ if st.button("▶️ Lancer le run", type="primary", use_container_width=True, k
             st.toast(f"Run enregistré (id={run_id})", icon="🗄️")
 
     except Exception as e:
+        tb = traceback.format_exc()
         st.session_state["last_run"] = None
         st.session_state["last_logs"] = ""
         st.session_state["last_run_error"] = str(e)
+
         st.error(f"Erreur run: {e}")
+        with st.expander("📌 Détail de l’erreur (traceback)", expanded=True):
+            st.code(tb, language="text")
+
         _ = save_run_history(
             port=p,
             res=None,
@@ -104,7 +111,7 @@ if st.button("▶️ Lancer le run", type="primary", use_container_width=True, k
             use_bond_override=use_override,
             verbose=verbose,
             status="error",
-            error_txt=str(e),
+            error_txt=tb,  # 👈 on stocke le traceback complet
         )
 
 

@@ -42,9 +42,14 @@ st.divider()
 
 p = st.session_state["portfolio"]
 
+ALLOWED_EQ_BUCKETS = [7, 8]
+ALLOWED_CCY = ["EUR", "USD"]
+
 tab1, tab2, tab3 = st.tabs(["Equity Calls", "GIRR Swaps", "GIRR Bonds"])
 
 with tab1:
+    st.info("**Démo Equity** : seuls les **buckets 7 et 8** sont disponibles dans cette démo.", icon="ℹ️")
+
     rows = equity_rows_from_portfolio(p)
     edited = st.data_editor(
         rows,
@@ -52,7 +57,8 @@ with tab1:
         use_container_width=True,
         key="pf_eq_editor",
         column_config={
-            "bucket": st.column_config.NumberColumn("bucket", step=1),
+            # ✅ On force le choix du bucket (évite KeyError si bucket non configuré)
+            "bucket": st.column_config.SelectboxColumn("bucket", options=ALLOWED_EQ_BUCKETS, required=True),
             "N": st.column_config.NumberColumn("N"),
             "S0": st.column_config.NumberColumn("S0"),
             "K": st.column_config.NumberColumn("K"),
@@ -65,6 +71,8 @@ with tab1:
     st.session_state["_eq_rows"] = edited
 
 with tab2:
+    st.info("**Démo GIRR Swaps** : seules les devises **EUR** et **USD** sont disponibles dans cette démo.", icon="ℹ️")
+
     rows = swaps_rows_from_portfolio(p)
     edited = st.data_editor(
         rows,
@@ -72,7 +80,8 @@ with tab2:
         use_container_width=True,
         key="pf_sw_editor",
         column_config={
-            "ccy": st.column_config.TextColumn("ccy"),
+            # ✅ On force la devise à EUR/USD (et ça évite les saisies incohérentes)
+            "ccy": st.column_config.SelectboxColumn("ccy", options=ALLOWED_CCY, required=True),
             "notional": st.column_config.NumberColumn("notional"),
             "maturity": st.column_config.NumberColumn("maturity", step=1),
             "receive_fixed": st.column_config.CheckboxColumn("receive_fixed"),
@@ -81,6 +90,8 @@ with tab2:
     st.session_state["_sw_rows"] = edited
 
 with tab3:
+    st.info("**Démo GIRR Bonds** : seules les devises **EUR** et **USD** sont disponibles dans cette démo.", icon="ℹ️")
+
     rows = bonds_rows_from_portfolio(p)
     edited = st.data_editor(
         rows,
@@ -88,7 +99,8 @@ with tab3:
         use_container_width=True,
         key="pf_bo_editor",
         column_config={
-            "ccy": st.column_config.TextColumn("ccy"),
+            # ✅ On force la devise à EUR/USD
+            "ccy": st.column_config.SelectboxColumn("ccy", options=ALLOWED_CCY, required=True),
             "notional": st.column_config.NumberColumn("notional"),
             "coupon_rate": st.column_config.NumberColumn("coupon_rate"),
             "maturity": st.column_config.NumberColumn("maturity", step=1),
@@ -105,6 +117,15 @@ with c1:
             eq_rows = st.session_state.get("_eq_rows", [])
             sw_rows = st.session_state.get("_sw_rows", [])
             bo_rows = st.session_state.get("_bo_rows", [])
+
+            # (optionnel) normaliser les devises au cas où
+            for r in sw_rows:
+                if r and "ccy" in r and r["ccy"] is not None:
+                    r["ccy"] = str(r["ccy"]).strip().upper()
+            for r in bo_rows:
+                if r and "ccy" in r and r["ccy"] is not None:
+                    r["ccy"] = str(r["ccy"]).strip().upper()
+
             st.session_state["portfolio"] = portfolio_from_rows(eq_rows, sw_rows, bo_rows)
             st.success("Portfolio mis à jour ✅")
         except Exception as e:

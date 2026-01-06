@@ -9,31 +9,71 @@ apply_page_config()
 apply_pro_css()
 init_session_state()
 
-st.title("FRTB SA / SBM — Mini Dashboard")
+st.title("Moteur FRTB SA / SBM ")
 st.caption("Interface Streamlit pour piloter le portfolio, le marché, les configs et lancer le moteur de calcul.")
 
-col1, col2, col3, col4 = st.columns(4)
-k = summary_kpis()
-col1.metric("Equity trades", k["n_eq"])
-col2.metric("GIRR swaps", k["n_sw"])
-col3.metric("GIRR bonds", k["n_bo"])
-col4.metric("Dernier run", k["last_run_status"])
+st.markdown("### 🏦 Contexte - Aggrégation reporting FRTB")
+
+st.info(
+    """
+Lors de mon stage de fin d’études chez **Banque Palatine** (équipe **Risque de Marché & Risque de Contrepartie**),
+j’ai travaillé sur la **consolidation / agrégation de reportings FRTB** du département Risques Financiers.
+
+Dans ce contexte, les calculs étaient réalisés via une **librairie Python** produisant des sorties structurées,
+et l’enjeu côté reporting consistait à **standardiser les inputs/outputs**, **assembler** l’information et la
+restituer sous un **format Excel consolidé**, exploitable pour le pilotage.
+""",
+    icon="📌",
+)
+
+st.warning(
+    """
+Je ne dispose pas des **données internes** ni de la **documentation** nécessaires
+pour illustrer les traitements de manière “réelle”.  
+Ce projet est donc une **réplique** : il ne reproduit pas l’environnement interne, mais il recrée
+la **chaîne de production** et la logique de reporting.
+""",
+    icon="⚠️",
+)
+
+st.markdown("### 🎯 Ce que démontre ce mini-projet (workflow end-to-end)")
+
+cA, cB, cC, cD = st.columns(4)
+with cA:
+    st.markdown("**1) Inputs normalisés**")
+    st.caption("Portfolio • Market snapshot • Configs réglementaires")
+with cB:
+    st.markdown("**2) Moteur FRTB SA/SBM**")
+    st.caption("Sensibilités • WS • Agrégations intra/inter-bucket")
+with cC:
+    st.markdown("**3) Restitution reporting-ready**")
+    st.caption("Tables • Graphiques • Matrices ρ • Steps explicables")
+with cD:
+    st.markdown("**4) Traçabilité & rejouabilité**")
+    st.caption("Logs capturés • Runs historisés • Snapshots restaurables")
+
+st.success(
+    """
+✅ **En résumé** : les données sont **synthétiques** et le périmètre est **pédagogique** (Equity + GIRR),
+mais l’application illustre concrètement ce que j’ai fait en stage :
+**structurer** les entrées/sorties d’un moteur, **consolider** un reporting, et assurer la **reproductibilité**.
+""",
+    icon="✅",
+)
+
+with st.expander("🔎 Comment je m’y suis pris (approche “industrie du reporting”)", expanded=False):
+    st.markdown(
+        """
+- **Contrat de données** : définition d’un format pivot pour le portfolio (CSV) et d’un snapshot marché (courbes/FX).  
+- **Séparation calcul / restitution** : le moteur renvoie des résultats structurés ; l’UI se charge de la mise en forme.  
+- **Explicabilité** : affichage étape-par-étape (WS, Kb, totaux par scénario), matrices de corrélation et graphiques.  
+- **Audit trail** : capture des logs + historisation SQLite des runs (statut, KPIs, snapshots, exports) pour rejouer/comparer.
+"""
+    )
 
 st.divider()
-st.markdown(
-    """
-### Navigation
-Utilise les pages à gauche :
-- **Overview** : résumé + état courant
-- **Portfolio** : upload / édition interactive
-- **Market** : courbes + FX
-- **Configs** : paramètres Equity / GIRR
-- **Run & Results** : exécution + résultats + logs
-- **Export** : téléchargement des outputs
 
-> Astuce : le moteur original `FRTBEngine.run()` imprime beaucoup — on capture ces logs et on les affiche.
-"""
-)
+
 
 if st.session_state.get("last_logs"):
     with st.expander("Afficher les logs du dernier run", expanded=False):

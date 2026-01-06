@@ -10,31 +10,71 @@ apply_page_config()
 apply_pro_css()
 init_session_state()
 
-st.title("FRTB SA / SBM — Mini Dashboard")
+st.title("Moteur FRTB SA / SBM ")
 st.caption("Interface Streamlit pour piloter le portfolio, le marché, les configs et lancer le moteur de calcul.")
 
-col1, col2, col3, col4 = st.columns(4)
-k = summary_kpis()
-col1.metric("Equity trades", k["n_eq"])
-col2.metric("GIRR swaps", k["n_sw"])
-col3.metric("GIRR bonds", k["n_bo"])
-col4.metric("Dernier run", k["last_run_status"])
+st.markdown("### 🏦 Contexte - Aggrégation reporting FRTB")
+
+st.info(
+    """
+Lors de mon stage de fin d’études chez **Banque Palatine** (équipe **Risque de Marché & Risque de Contrepartie**),
+j’ai travaillé sur la **consolidation / agrégation de reportings FRTB** du département Risques Financiers.
+
+Dans ce contexte, les calculs étaient réalisés via une **librairie Python** produisant des sorties structurées,
+et l’enjeu côté reporting consistait à **standardiser les inputs/outputs**, **assembler** l’information et la
+restituer sous un **format Excel consolidé**, exploitable pour le pilotage.
+""",
+    icon="📌",
+)
+
+st.warning(
+    """
+Je ne dispose pas des **données internes** ni de la **documentation** nécessaires
+pour illustrer les traitements de manière “réelle”.  
+Ce projet est donc une **réplique** : il ne reproduit pas l’environnement interne, mais il recrée
+la **chaîne de production** et la logique de reporting.
+""",
+    icon="⚠️",
+)
+
+st.markdown("### 🎯 Ce que démontre ce mini-projet (workflow end-to-end)")
+
+cA, cB, cC, cD = st.columns(4)
+with cA:
+    st.markdown("**1) Inputs normalisés**")
+    st.caption("Portfolio • Market snapshot • Configs réglementaires")
+with cB:
+    st.markdown("**2) Moteur FRTB SA/SBM**")
+    st.caption("Sensibilités • WS • Agrégations intra/inter-bucket")
+with cC:
+    st.markdown("**3) Restitution reporting-ready**")
+    st.caption("Tables • Graphiques • Matrices ρ • Steps explicables")
+with cD:
+    st.markdown("**4) Traçabilité & rejouabilité**")
+    st.caption("Logs capturés • Runs historisés • Snapshots restaurables")
+
+st.success(
+    """
+✅ **En résumé** : les données sont **synthétiques** et le périmètre est **pédagogique** (Equity + GIRR),
+mais l’application illustre concrètement ce que j’ai fait en stage :
+**structurer** les entrées/sorties d’un moteur, **consolider** un reporting, et assurer la **reproductibilité**.
+""",
+    icon="✅",
+)
+
+with st.expander("🔎 Comment je m’y suis pris (approche “industrie du reporting”)", expanded=False):
+    st.markdown(
+        """
+- **Contrat de données** : définition d’un format pivot pour le portfolio (CSV) et d’un snapshot marché (courbes/FX).  
+- **Séparation calcul / restitution** : le moteur renvoie des résultats structurés ; l’UI se charge de la mise en forme.  
+- **Explicabilité** : affichage étape-par-étape (WS, Kb, totaux par scénario), matrices de corrélation et graphiques.  
+- **Audit trail** : capture des logs + historisation SQLite des runs (statut, KPIs, snapshots, exports) pour rejouer/comparer.
+"""
+    )
 
 st.divider()
-st.markdown(
-    """
-### Navigation
-Utilise les pages à gauche :
-- **Overview** : résumé + état courant
-- **Portfolio** : upload / édition interactive
-- **Market** : courbes + FX
-- **Configs** : paramètres Equity / GIRR
-- **Run & Results** : exécution + résultats + logs
-- **Export** : téléchargement des outputs
 
-> Astuce : le moteur original `FRTBEngine.run()` imprime beaucoup — on capture ces logs et on les affiche.
-"""
-)
+
 
 if st.session_state.get("last_logs"):
     with st.expander("Afficher les logs du dernier run", expanded=False):
@@ -52,45 +92,94 @@ from typing import Tuple
 
 
 def lin_interp(x: float, x0: float, y0: float, x1: float, y1: float) -> float:
+    """
+    Interpolation linéaire simple entre deux points (x0, y0) et (x1, y1).
+
+    - On renvoie y(x) = y0 + w * (y1 - y0) avec w = (x - x0) / (x1 - x0).
+    """
+    
     if abs(x1 - x0) < 1e-15:
         return y0
+
+    # Poids d'interpolation
     w = (x - x0) / (x1 - x0)
     return y0 + w * (y1 - y0)
 
 
 @dataclass(frozen=True)
 class ZeroCurve:
+    """
+    Courbe de taux zéro (zéro-coupon) définie par des nœuds (tenors) et leurs taux z(t).
+
+    - tenors : maturités en années (ex: 0.25, 0.5, 1, 2, ...)
+    - zeros  : taux zéro correspondants 
+
+    """
     tenors: Tuple[float, ...]
     zeros: Tuple[float, ...]
 
     def z(self, t: float) -> float:
+        """
+        Renvoie le taux zéro z(t) à la maturité t.
+
+        - Extrapolation plate aux extrémités (si t est en dehors des nœuds).
+        - Interpolation linéaire entre deux nœuds sinon.
+        """
         T = self.tenors
         Z = self.zeros
 
+        # Extrapolation à gauche : on renvoie la première valeur
         if t <= T[0]:
             return Z[0]
+
+        # Extrapolation à droite : on renvoie la dernière valeur
         if t >= T[-1]:
             return Z[-1]
 
+        # Localiser l'intervalle [T[i], T[j]] qui encadre t (avec j = premier indice tel que T[j] >= t)
         j = bisect.bisect_left(T, t)
+
+        # Si t tombe exactement sur un nœud, on renvoie la valeur du nœud
         if abs(T[j] - t) < 1e-15:
             return Z[j]
+
+        # Sinon, interpolation entre le nœud précédent i=j-1 et le nœud j
         i = j - 1
         return lin_interp(t, T[i], Z[i], T[j], Z[j])
 
     def df(self, t: float) -> float:
+        """
+        Facteur d'actualisation P(0,t) obtenu à partir du taux zéro z(t).
+
+        Hypothèse : taux zéro continûment composés
+            df(t) = exp(-z(t) * t)
+        """
         return math.exp(-self.z(t) * t)
 
     def bumped(self, bump_t: float, bump_size: float = 1e-4) -> "ZeroCurve":
+        """
+        Renvoie une nouvelle courbe où l'on a appliqué un bump (choc) sur UN nœud précis.
+
+        - bump_t doit correspondre exactement à un tenor existant.
+        - bump_size est typiquement un choc en taux (ex: 1e-4 = 1bp).
+
+        Usage : bump&reprice pour approximer des sensibilités
+            s_k ≈ (PV(z bumped at T_k) - PV(z)) / bump_size
+        """
         idx = None
+
         for k, T in enumerate(self.tenors):
             if abs(T - bump_t) < 1e-12:
                 idx = k
                 break
+
         if idx is None:
             raise ValueError(f"bump_t={bump_t} is not an exact curve node")
+
         z = list(self.zeros)
         z[idx] += bump_size
+
+        # On renvoie une nouvelle instance avec les mêmes tenors et les z modifiés
         return ZeroCurve(self.tenors, tuple(z))
 
 
@@ -295,7 +384,30 @@ def norm_pdf(x: float) -> float:
     return (1.0 / math.sqrt(2.0 * math.pi)) * math.exp(-0.5 * x * x)
 
 
+# =============================================================================
+# Black-Scholes (call) : prix + delta + vega
+# =============================================================================
+# Convention :
+# - S : spot
+# - K : strike
+# - T : maturité (années)
+# - r : taux sans risque (continu)
+# - q : repo/dividend yield (continu) -> discount du spot
+# - sigma : vol (constante)
+#
+# Formules :
+#  d1 = [ln(S/K) + (r-q+0.5σ²)T] / (σ√T)
+#  d2 = d1 - σ√T
+#  Call = S e^{-qT} Φ(d1) - K e^{-rT} Φ(d2)
+#  Delta = e^{-qT} Φ(d1)
+#  Vega  = S e^{-qT} √T φ(d1)
+
+
 def bs_call_price_delta_vega(S: float, K: float, T: float, r: float, q: float, sigma: float):
+    """
+    Pricing + Greeks du call européen (Black-Scholes) :
+    retourne (price, delta, vega, d1, d2).
+    """
     if T <= 0.0:
         raise ValueError("T doit être > 0")
     if sigma <= 0.0:
@@ -315,15 +427,46 @@ def bs_call_price_delta_vega(S: float, K: float, T: float, r: float, q: float, s
     return price, delta, vega, d1, d2
 
 
+# =============================================================================
+# Config Equity FRTB SA/SBM
+# =============================================================================
+# Cette config contient :
+# - delta_rw : RW (spot/repo/curv) par bucket Equity
+# - rho_spot_repo_med : corr spot vs repo (scénario medium)
+# - gamma_inter_bucket_med : corr inter-bucket (scénario medium)
+# - rw_vega : RW vega unique (simplification pédagogique)
+
+
 @dataclass(frozen=True)
 class EquityConfig:
-    delta_rw: Dict[int, Dict[str, float]]   # {bucket: {"spot":..., "repo":..., "curv":...}}
+    delta_rw: Dict[int, Dict[str, float]]   
     rho_spot_repo_med: float
     gamma_inter_bucket_med: float
     rw_vega: float
 
 
+# =============================================================================
+# Moteur Equity : DELTA + VEGA + CURVATURE (SBM)
+# =============================================================================
+# Le calcul suit une logique "SBM", avec 3 blocs :
+# 1) Metrics / Greeks par trade
+# 2) Capital DELTA (intra-bucket puis inter-bucket, scénarios low/med/high)
+# 3) Capital VEGA 
+# 4) Capital CURVATURE (stress +/- RW^C sur spot)
+#
+# Puis agrégation finale : K_total = KΔ + Kν + Kcurv, scénario worst-of.
+
+
 def equity_sbm(trades: List[EquityCallTrade], cfg: EquityConfig, verbose: bool = True) -> Dict[str, Any]:
+    """
+    Calcule le capital Equity SA/SBM pour un portefeuille d'options call (delta+vega+curv).
+
+    Retourne un dictionnaire riche (K_final + détails) pour alimenter l'UI :
+    - bucket_delta : WS_spot/WS_repo + K_b low/med/high par bucket
+    - bucket_vega  : VR pondéré + K_b par bucket
+    - bucket_curv  : K_b^curv par bucket
+    - totals       : total low/med/high
+    """
     if not trades:
         return {"K_final": 0.0, "details": {}}
 
@@ -332,7 +475,13 @@ def equity_sbm(trades: List[EquityCallTrade], cfg: EquityConfig, verbose: bool =
         print("EQUITY — FRTB SA / SBM (Delta + Vega + Curvature)")
         print("=" * 90)
 
-    # ---- 1) Metrics par trade
+    # -------------------------------------------------------------------------
+    # [1] Metrics par trade : pricing + Greeks + sensibilités "SBM-like"
+    # -------------------------------------------------------------------------
+    # On calcule pour chaque trade :
+    # - PV (valeur) = N * price
+    # - s_spot : sensibilité delta au spot (approx) = N * S0 * delta
+    # - VR : "Vega Risk" stylisé = N * vega * sigma
     tmet: Dict[str, Dict[str, float]] = {}
     if verbose:
         print("\n[1] Pricing + Greeks")
@@ -341,8 +490,11 @@ def equity_sbm(trades: List[EquityCallTrade], cfg: EquityConfig, verbose: bool =
         price, delta, vega, d1, d2 = bs_call_price_delta_vega(t.S0, t.K, t.T, t.r, t.q_repo, t.sigma)
         PV = t.N * price
 
+        # Sensibilités utilisées ensuite dans le bloc DELTA
         s_spot = t.N * t.S0 * delta
         s_repo = t.N * (-t.T * t.S0 * delta)
+
+        # Vega Risk utilisé dans le bloc VEGA
         VR = t.N * vega * t.sigma
 
         tmet[t.name] = {"bucket": float(t.bucket), "PV": PV, "s_spot": s_spot, "s_repo": s_repo, "VR": VR}
@@ -352,33 +504,46 @@ def equity_sbm(trades: List[EquityCallTrade], cfg: EquityConfig, verbose: bool =
             print(f"    d1={d1:.6f} | d2={d2:.6f} | PV={fmt_money(PV)}")
             print(f"    s_spot={fmt_money(s_spot)} | s_repo={fmt_money(s_repo)} | VR={fmt_money(VR)}")
 
+    # Liste des buckets equity présents dans le portfolio
     buckets = sorted({int(x["bucket"]) for x in tmet.values()})
 
-    # ---- 2) Delta
+    # -------------------------------------------------------------------------
+    # [2] DELTA (SBM) : 2 facteurs par bucket (spot, repo)
+    # -------------------------------------------------------------------------
     if verbose:
         print("\n" + "-" * 90)
         print("[2] DELTA (SBM)")
         print("-" * 90)
 
+    # Corrélations scénario low/med/high :
+    # - rho_sr : intra-bucket entre spot et repo
+    # - gamma_ib : inter-bucket (entre buckets equity)
     rho_sr = low_med_high(cfg.rho_spot_repo_med)
     gamma_ib = low_med_high(cfg.gamma_inter_bucket_med)
 
     bucket_delta: Dict[int, Dict[str, float]] = {}
     for b in buckets:
+        # Agrégation des sensibilités par bucket
         s_spot_b = sum(m["s_spot"] for m in tmet.values() if int(m["bucket"]) == b)
         s_repo_b = sum(m["s_repo"] for m in tmet.values() if int(m["bucket"]) == b)
 
+        # Risk Weights du bucket (spot/repo)
         rw_spot = cfg.delta_rw[b]["spot"]
         rw_repo = cfg.delta_rw[b]["repo"]
 
+        # Weighted Sensitivities (WS_k = RW_k * s_k)
         WS_spot = rw_spot * s_spot_b
         WS_repo = rw_repo * s_repo_b
 
+        # Intra-bucket : K_b(scenario) = sqrt( WS' rho WS )
+        # Ici, dimension 2 => formule fermée :
+        # Kb = sqrt( WS_spot^2 + WS_repo^2 + 2*rho*WS_spot*WS_repo )
         Kb = {}
         for sc in SCENARIOS:
             rho = rho_sr[sc]
             Kb[sc] = math.sqrt(max(WS_spot * WS_spot + WS_repo * WS_repo + 2.0 * rho * WS_spot * WS_repo, 0.0))
 
+        # S_b : "bucket exposure" (somme des WS) utilisée dans l'inter-bucket
         S_b = WS_spot + WS_repo
         bucket_delta[b] = {
             "WS_spot": WS_spot, "WS_repo": WS_repo, "S": S_b,
@@ -390,8 +555,10 @@ def equity_sbm(trades: List[EquityCallTrade], cfg: EquityConfig, verbose: bool =
             print(f"    WS_spot={fmt_money(WS_spot)} | WS_repo={fmt_money(WS_repo)} | S_b={fmt_money(S_b)}")
             print(f"    K_b low/med/high = {fmt_money(Kb['low'])} / {fmt_money(Kb['medium'])} / {fmt_money(Kb['high'])}")
 
+    # Inter-bucket DELTA : on agrège les K_b entre buckets avec gamma
+    # inter_bucket() encapsule la formule d'agrégation (SBM stylisée).
     Kd = {}
-    X = {b: bucket_delta[b]["S"] for b in buckets}
+    X = {b: bucket_delta[b]["S"] for b in buckets}  # X_b = S_b
     for sc in SCENARIOS:
         key = {"low": "K_low", "medium": "K_med", "high": "K_high"}[sc]
         Kb_sc = {b: bucket_delta[b][key] for b in buckets}
@@ -402,7 +569,11 @@ def equity_sbm(trades: List[EquityCallTrade], cfg: EquityConfig, verbose: bool =
         print(f"    gamma low/med/high = {gamma_ib['low']:.6f} / {gamma_ib['medium']:.6f} / {gamma_ib['high']:.6f}")
         print(f"    KΔ low/med/high = {fmt_money(Kd['low'])} / {fmt_money(Kd['medium'])} / {fmt_money(Kd['high'])}")
 
-    # ---- 3) Vega
+    # -------------------------------------------------------------------------
+    # [3] VEGA (SBM) : simplifié (1 facteur vega par bucket)
+    # -------------------------------------------------------------------------
+    # Ici, on applique un RW vega unique (rw_vega) et on prend K_b = |WS_b|.
+    # Puis inter-bucket via gamma (même gamma_ib que DELTA, pour rester simple).
     if verbose:
         print("\n" + "-" * 90)
         print("[3] VEGA (SBM)")
@@ -412,7 +583,7 @@ def equity_sbm(trades: List[EquityCallTrade], cfg: EquityConfig, verbose: bool =
     for b in buckets:
         VR_b = sum(m["VR"] for m in tmet.values() if int(m["bucket"]) == b)
         WS_b = cfg.rw_vega * VR_b
-        K_b = abs(WS_b)
+        K_b = abs(WS_b)  # simplification : 1 facteur => pas de corr intra-bucket
         bucket_vega[b] = {"S": WS_b, "K": K_b}
 
         if verbose:
@@ -428,29 +599,42 @@ def equity_sbm(trades: List[EquityCallTrade], cfg: EquityConfig, verbose: bool =
         print("\n  Inter-bucket VEGA:")
         print(f"    Kν low/med/high = {fmt_money(Kv['low'])} / {fmt_money(Kv['medium'])} / {fmt_money(Kv['high'])}")
 
-    # ---- 4) Curvature
+    # -------------------------------------------------------------------------
+    # [4] CURVATURE (SBM) : choc spot +/- RW^C et "CVR" (curvature risk)
+    # -------------------------------------------------------------------------
+    # On applique un choc relatif RW^C au spot :
+    #   S+ = S0*(1+RW^C), S- = S0*(1-RW^C)
+    # On recalcule V+ et V- et on construit :
+    #   CVR+ = -(V+ - V0 - RW^C*s_spot)
+    #   CVR- = -(V- - V0 + RW^C*s_spot)
+    # Puis K_b^curv = max(0, CVR+, CVR-) (au niveau bucket on retient le pire trade).
     if verbose:
         print("\n" + "-" * 90)
         print("[4] CURVATURE (SBM)")
         print("-" * 90)
 
+    # Pour la curvature, on prend souvent des corrélations au carré (stylisation ici)
     gammaC = low_med_high(cfg.gamma_inter_bucket_med ** 2)
     bucket_curv = {b: 0.0 for b in buckets}
 
     for t in trades:
         b = t.bucket
-        rwc = cfg.delta_rw[b]["curv"]
+        rwc = cfg.delta_rw[b]["curv"]  # RW^C (choc curvature) du bucket
 
+        # Repricing de base + s_spot (au point initial)
         price0, delta0, _, _, _ = bs_call_price_delta_vega(t.S0, t.K, t.T, t.r, t.q_repo, t.sigma)
         V0 = t.N * price0
         s_spot = t.N * t.S0 * delta0
 
+        # Repricing aux points stressés (+/-)
         V_plus = t.N * bs_call_price_delta_vega(t.S0 * (1.0 + rwc), t.K, t.T, t.r, t.q_repo, t.sigma)[0]
         V_minus = t.N * bs_call_price_delta_vega(t.S0 * (1.0 - rwc), t.K, t.T, t.r, t.q_repo, t.sigma)[0]
 
+        # Curvature Risk : on retire la composante delta linéaire
         CVR_plus = -(V_plus - V0 - rwc * s_spot)
         CVR_minus = -(V_minus - V0 + rwc * s_spot)
 
+        # Le bucket retient le "pire" (et on coupe à 0 comme dans ton code)
         bucket_curv[b] = max(bucket_curv[b], max(CVR_plus, 0.0), max(CVR_minus, 0.0))
 
         if verbose:
@@ -464,8 +648,11 @@ def equity_sbm(trades: List[EquityCallTrade], cfg: EquityConfig, verbose: bool =
         for b in buckets:
             print(f"    Bucket {b}: K_b^curv={fmt_money(bucket_curv[b])}")
 
+    # Inter-bucket CURVATURE
+    # Dans ta version, tu utilises X = K_b^curv (plutôt que S_b) :
+    # on reproduit exactement cette convention.
     Kc = {}
-    Xc = dict(bucket_curv)  # comme ton code: X = K_b^curv
+    Xc = dict(bucket_curv)  # X_b = K_b^curv
     for sc in SCENARIOS:
         Kb_sc = dict(bucket_curv)
         Kc[sc] = inter_bucket(Kb_sc, Xc, gammaC[sc])
@@ -475,6 +662,9 @@ def equity_sbm(trades: List[EquityCallTrade], cfg: EquityConfig, verbose: bool =
         print(f"    gamma^C low/med/high = {gammaC['low']:.6f} / {gammaC['medium']:.6f} / {gammaC['high']:.6f}")
         print(f"    Kcurv low/med/high = {fmt_money(Kc['low'])} / {fmt_money(Kc['medium'])} / {fmt_money(Kc['high'])}")
 
+    # -------------------------------------------------------------------------
+    # [5] Total Equity : somme (Delta + Vega + Curvature) puis worst-of scénario
+    # -------------------------------------------------------------------------
     totals = {sc: Kd[sc] + Kv[sc] + Kc[sc] for sc in SCENARIOS}
     K_final = max(totals.values())
     worst = max(totals, key=lambda k: totals[k])
@@ -543,24 +733,55 @@ from portfolio import BondTrade, SwapTrade
 from utils import SCENARIOS, clip_corr, basel_scale, fmt_int, fmt_num, inter_bucket, low_med_high
 
 
-# --- swap pricing (identique logique swap.py)
+# =============================================================================
+# 1) Pricing (swap + bond)
+# =============================================================================
+# Objectif : avoir une mécanique simple et transparente pour :
+# - obtenir des PV (PV0 et PV bumped)
+# - calculer des sensibilités par bump&reprice (dPV/dz(Tk))
+
+
+# --- swap pricing 
 def swap_annuity(curve: ZeroCurve, T: int) -> float:
+    """
+    A(T) = somme des facteurs d'actualisation des paiements fixes.
+    """
     return sum(curve.df(i) for i in range(1, T + 1))
 
 
 def par_swap_rate(curve: ZeroCurve, T: int) -> float:
+    """
+    Taux swap par (par swap rate) :
+      S(T) = (1 - DF(T)) / A(T)
+    avec A(T) l'annuité (somme DF des dates fixes).
+    """
     A = swap_annuity(curve, T)
     return (1.0 - curve.df(T)) / A
 
 
 def pv_swap(curve: ZeroCurve, N: float, T: int, K: float, receive_fixed: bool) -> float:
+    """
+    PV d'un swap vanilla "payer/receiver" dans une approche très simple :
+      PV ≈ N * (K - S) * A   si Receive-Fixed
+      PV ≈ N * (S - K) * A   si Pay-Fixed
+
+    où :
+      - K est le taux fixe contractualisé
+      - S est le taux par du marché sur maturité T
+      - A est l'annuité (somme DF)
+    """
     A = swap_annuity(curve, T)
     S = par_swap_rate(curve, T)
     return N * (K - S) * A if receive_fixed else N * (S - K) * A
 
 
-# --- bond pricing (identique logique bond.py)
+# --- bond pricing 
 def bond_cashflows(notional: float, coupon_rate: float, maturity: int) -> List[Tuple[float, float]]:
+    """
+    Génère les cashflows d'un bond à coupons annuels :
+    - coupons chaque année
+    - remboursement du principal à maturité
+    """
     cpn = notional * coupon_rate
     out = []
     for yr in range(1, maturity + 1):
@@ -572,24 +793,50 @@ def bond_cashflows(notional: float, coupon_rate: float, maturity: int) -> List[T
 
 
 def pv_bond(curve: ZeroCurve, notional: float, coupon_rate: float, maturity: int) -> float:
+    """
+    PV du bond = somme des cashflows actualisés sur la ZeroCurve.
+    """
     total = 0.0
     for t, cf in bond_cashflows(notional, coupon_rate, maturity):
         total += cf * curve.df(t)
     return total
 
 
+# =============================================================================
+# 2) Configuration FRTB GIRR (Risk Weights + règles corrélations)
+# =============================================================================
+
 @dataclass(frozen=True)
 class GirrConfig:
+    """
+    Paramétrage GIRR SA/SBM (delta) dans ce mini moteur.
+
+    - rw_by_tenor : RW_k par nœud de tenor (ex: 0.5Y, 1Y, 2Y, ...)
+    - specified_currency_reduction : réduction RW pour currencies "spécifiées"
+      (dans le cadre FRTB SA, certaines monnaies ont un facteur sqrt(2) simplifié)
+    - bump_bp : taille du bump appliqué sur le taux zéro z(Tk)
+    - gamma_inter_ccy_med : corrélation inter-bucket (entre currencies), scénario medium
+    - scenario_rule : comment on dérive low/med/high à partir d'une corrélation base
+        * "lowmedhigh"  : règle custom (low_med_high)
+        * "basel_scale" : règle Bâle (0.75 / 1 / 1.25)
+    - rho_rule : corrélation intra-bucket (entre tenors d'une même currency bucket)
+        * "exp_absdiff" : exp(-a*|Tk-Tl|)
+        * "basel_tenor" : exp(-theta*|log(Tk/Tl)|) floored à 0.4
+    - rho_param : paramètre "a" (exp_absdiff) ou "theta" (basel_tenor)
+    """
     rw_by_tenor: Dict[float, float]
     specified_currency_reduction: bool
     bump_bp: float
     gamma_inter_ccy_med: float
-    scenario_rule: str   # "lowmedhigh" or "basel_scale"
-    rho_rule: str        # "exp_absdiff" or "basel_tenor"
-    rho_param: float     # a (exp_absdiff) OR theta (basel_tenor)
+    scenario_rule: str   
+    rho_rule: str        
+    rho_param: float    
 
 
 def scenario_gamma(cfg: GirrConfig, scenario: str) -> float:
+    """
+    Gamma inter-bucket (entre currencies) en fonction du scénario low/med/high.
+    """
     if cfg.scenario_rule == "lowmedhigh":
         return low_med_high(cfg.gamma_inter_ccy_med)[scenario]
     if cfg.scenario_rule == "basel_scale":
@@ -598,12 +845,21 @@ def scenario_gamma(cfg: GirrConfig, scenario: str) -> float:
 
 
 def rho_tenor_basel(Tk: float, Tl: float, theta: float) -> float:
+    """
+    Corrélation "Bâle-like" entre tenors Tk et Tl :
+      rho = max( exp(-theta * |log(Tk/Tl)|), 0.4 )
+
+    - Le floor à 0.4 reflète une borne minimale.
+    """
     if Tk <= 0.0 or Tl <= 0.0:
         return 0.4
     return max(math.exp(-theta * abs(math.log(Tk / Tl))), 0.4)
 
 
 def scenario_adjust_corr(cfg: GirrConfig, scenario: str, base_corr: float) -> float:
+    """
+    Applique la règle scénario (low/med/high) à une corrélation "base".
+    """
     if cfg.scenario_rule == "lowmedhigh":
         return clip_corr(low_med_high(base_corr)[scenario])
     if cfg.scenario_rule == "basel_scale":
@@ -612,6 +868,15 @@ def scenario_adjust_corr(cfg: GirrConfig, scenario: str, base_corr: float) -> fl
 
 
 def corr_matrix_for_tenors(tenors: List[float], cfg: GirrConfig, scenario: str) -> List[List[float]]:
+    """
+    Construit la matrice de corrélation intra-bucket ρ (entre tenors) pour un scénario donné.
+
+    - Diagonale = 1
+    - Hors-diagonale :
+        * exp_absdiff : exp(-a*|Tk-Tl|)
+        * basel_tenor : rho_tenor_basel(Tk,Tl,theta)
+    - Puis on applique l'ajustement scénario + clipping.
+    """
     n = len(tenors)
     out = [[0.0] * n for _ in range(n)]
     for i in range(n):
@@ -630,12 +895,15 @@ def corr_matrix_for_tenors(tenors: List[float], cfg: GirrConfig, scenario: str) 
     return out
 
 
-# ---- bump&reprice générique (swaps + bonds)
+# =============================================================================
+# 3) Bump & Reprice : calcul générique des sensibilités s_k = dPV/dz(Tk)
+# =============================================================================
+# Ici on veut une fonction réutilisable pour plusieurs types de trades (swaps, bonds).
 
-PrepareCtx = Callable[[Any, ZeroCurve], Any]
-PVWithCtx = Callable[[Any, ZeroCurve, Any], float]
-CCYFunc = Callable[[Any], str]
-TradePrinter = Callable[[Any, float], None]
+PrepareCtx = Callable[[Any, ZeroCurve], Any]            
+PVWithCtx = Callable[[Any, ZeroCurve, Any], float]      
+CCYFunc = Callable[[Any], str]                         
+TradePrinter = Callable[[Any, float], None]            
 
 
 def bump_and_reprice_sens(
@@ -648,44 +916,96 @@ def bump_and_reprice_sens(
     printer: Optional[TradePrinter],
     verbose: bool,
 ) -> Dict[str, Dict[float, float]]:
+    """
+    Calcule les sensibilités GIRR (par currency bucket et par tenor node) via bump&reprice.
+
+    Sortie :
+      out[ccy][Tk] = somme_{trades in ccy} dPV/dz(Tk) (exprimée dans reporting_ccy)
+
+    Workflow (trade par trade) :
+    1) PV0 avec la courbe "base"
+    2) pour chaque node Tk :
+         - on bump z(Tk) de bump_bp
+         - on recalcule PVb
+         - s_k = (PVb - PV0) / bump_bp
+    3) conversion FX vers reporting_ccy
+    4) agrégation par currency bucket
+    """
     tenors_nodes = sorted(cfg.rw_by_tenor.keys())
     out: Dict[str, Dict[float, float]] = {}
 
     for tr in trades:
+        # 1) Identifier la currency bucket du trade
         ccy = ccy_func(tr)
         curve0 = mkt.curves[ccy]
+
         ctx = prepare_ctx(tr, curve0)
+
+        # 3) PV "base"
         PV0 = pv_with_ctx(tr, curve0, ctx)
 
+        # 4) Calcul des sensibilités sur tous les nœuds de tenor
         sens_ccy = {T: 0.0 for T in tenors_nodes}
         for Tk in tenors_nodes:
+            # PV bumpé : on perturbe z(Tk) et on reprice
             PVb = pv_with_ctx(tr, curve0.bumped(Tk, cfg.bump_bp), ctx)
+
+            # dérivée numérique dPV/dz(Tk)
             s = (PVb - PV0) / cfg.bump_bp
+
+            # conversion en reporting_ccy 
             sens_ccy[Tk] += mkt.convert(s, ccy, mkt.reporting_ccy)
 
+        # 5) Agrégation dans la structure de sortie
         out.setdefault(ccy, {T: 0.0 for T in tenors_nodes})
         for T in tenors_nodes:
             out[ccy][T] += sens_ccy[T]
 
+        # 6) Logs optionnels par trade 
         if verbose and printer is not None:
             printer(tr, mkt.convert(PV0, ccy, mkt.reporting_ccy))
 
     return out
 
 
-# ---- delta SBM
+# =============================================================================
+# 4) GIRR Delta SBM : pondération RW + agrégation intra/inter bucket
+# =============================================================================
 
 def girr_delta_sbm(bucket_sens: Dict[str, Dict[float, float]], cfg: GirrConfig, verbose: bool) -> Dict[str, Any]:
+    """
+    Calcule le capital GIRR Delta selon un schéma SBM simplifié :
+
+    Entrée :
+      bucket_sens[ccy][Tk] = s_k (sensibilité non pondérée) par currency bucket et tenor node
+
+    Étapes :
+    (i)   appliquer RW_k (et la réduction specified_currency_reduction si demandé)
+    (ii)  WS_k = RW_k * s_k
+    (iii) intra-bucket : K_b = sqrt( WS' * rho * WS ) (rho dépend du scénario)
+    (iv)  inter-bucket : agrégation des K_b entre currencies via inter_bucket(Kb, S, gamma)
+          où S_ccy = somme_k WS_k (exposition agrégée bucket)
+
+    Sortie :
+      - K_final : max sur scénarios low/med/high
+      - totals  : K_total par scénario
+      - WS, S, Kb : objets intermédiaires
+    """
     if not bucket_sens:
         return {"K_final": 0.0, "details": {}}
 
     tenors_nodes = sorted(cfg.rw_by_tenor.keys())
 
+    # RW de base
     rw = dict(cfg.rw_by_tenor)
+
+    # Option FRTB : réduction pour currencies "spécifiées"
+    # Ici on applique RW / sqrt(2) .
     if cfg.specified_currency_reduction:
         for T in rw:
             rw[T] /= math.sqrt(2.0)
 
+    # WS_k et S_bucket (par currency)
     WS: Dict[str, Dict[float, float]] = {}
     S: Dict[str, float] = {}
     for ccy, sens in bucket_sens.items():
@@ -701,6 +1021,7 @@ def girr_delta_sbm(bucket_sens: Dict[str, Dict[float, float]], cfg: GirrConfig, 
                     print(f"    T={T:>5}Y | RW={100*rw[T]:.3f}% | WS={fmt_num(WS[ccy][T],6)}")
             print(f"    S_{ccy}={fmt_num(S[ccy],6)}")
 
+    # Kb[scenario][ccy] = K_b intra-bucket
     Kb: Dict[str, Dict[str, float]] = {sc: {} for sc in SCENARIOS}
 
     if verbose:
@@ -708,13 +1029,19 @@ def girr_delta_sbm(bucket_sens: Dict[str, Dict[float, float]], cfg: GirrConfig, 
 
     for sc in SCENARIOS:
         for ccy in WS:
+            # On ne conserve que les tenors non-nuls pour éviter matrices inutiles
             ten_nz = [T for T in tenors_nodes if WS[ccy][T] != 0.0]
             if not ten_nz:
                 Kb[sc][ccy] = 0.0
                 continue
 
+            # Matrice rho 
             rho = corr_matrix_for_tenors(ten_nz, cfg, scenario=sc)
+
+            # vecteur de WS
             w = [WS[ccy][T] for T in ten_nz]
+
+            # forme quadratique w' rho w
             val = sum(w[i] * rho[i][j] * w[j] for i in range(len(w)) for j in range(len(w)))
             Kb[sc][ccy] = math.sqrt(max(val, 0.0))
 
@@ -725,6 +1052,7 @@ def girr_delta_sbm(bucket_sens: Dict[str, Dict[float, float]], cfg: GirrConfig, 
     if verbose:
         print("\n[5] Inter-bucket aggregation")
 
+    # Agrégation inter-bucket entre currencies
     totals: Dict[str, float] = {}
     for sc in SCENARIOS:
         g = scenario_gamma(cfg, sc)
@@ -732,6 +1060,7 @@ def girr_delta_sbm(bucket_sens: Dict[str, Dict[float, float]], cfg: GirrConfig, 
         if verbose:
             print(f"  {sc.upper()}: gamma={g:.3f} | K_total={fmt_int(totals[sc])}")
 
+    # Capital final = pire scénario
     K_final = max(totals.values())
     worst = max(totals, key=lambda k: totals[k])
 
@@ -742,40 +1071,73 @@ def girr_delta_sbm(bucket_sens: Dict[str, Dict[float, float]], cfg: GirrConfig, 
     return {"K_final": K_final, "totals": totals, "WS": WS, "S": S, "Kb": Kb}
 
 
-# ---- helpers prêts à l'emploi pour swaps & bonds (wrappers)
+# =============================================================================
+# 5) Wrappers "prêts à l'emploi" : swaps et bonds
+# =============================================================================
+# Ces fonctions adaptent bump_and_reprice_sens à chaque type d'instrument
+# en définissant :
+# - comment préparer le contexte
+# - comment re-pricer
+
 
 def sensitivities_swaps(trades: List[SwapTrade], mkt: Market, cfg: GirrConfig, verbose: bool) -> Dict[str, Dict[float, float]]:
+    """
+    Sensibilités GIRR (dPV/dz(Tk)) pour une liste de swaps.
+
+    Choix pédagogique important :
+    - On "fixe" K0 au par rate initial (prepare_ctx) pour avoir PV0 ~ 0 (par swap),
+      ce qui isole la mécanique du bump&reprice.
+    """
     def prep_swap(tr: SwapTrade, curve0: ZeroCurve) -> float:
-        return par_swap_rate(curve0, tr.maturity)  # K0
+        return par_swap_rate(curve0, tr.maturity)
 
     def pv_swap_ctx(tr: SwapTrade, curve: ZeroCurve, K0: float) -> float:
+        # PV du swap en gardant K0 constant (on reprice vs la courbe bumpée)
         return pv_swap(curve, tr.notional, tr.maturity, K0, tr.receive_fixed)
 
     def print_swap(tr: SwapTrade, pv0_rep: float) -> None:
+        # Impression lisible dans les logs de run 
         print(f"\n  Swap {tr.name} ({tr.ccy}) | maturity={tr.maturity}Y | receive_fixed={tr.receive_fixed}")
         print(f"    PV0 ~ {pv0_rep:,.2f} {mkt.reporting_ccy}".replace(",", " ") + " (par swap)")
 
     return bump_and_reprice_sens(
-        trades=trades, mkt=mkt, cfg=cfg,
-        prepare_ctx=prep_swap, pv_with_ctx=pv_swap_ctx, ccy_func=lambda t: t.ccy,
-        printer=print_swap, verbose=verbose
+        trades=trades,
+        mkt=mkt,
+        cfg=cfg,
+        prepare_ctx=prep_swap,
+        pv_with_ctx=pv_swap_ctx,
+        ccy_func=lambda t: t.ccy,
+        printer=print_swap,
+        verbose=verbose
     )
 
 
 def sensitivities_bonds(trades: List[BondTrade], mkt: Market, cfg: GirrConfig, verbose: bool) -> Dict[str, Dict[float, float]]:
+    """
+    Sensibilités GIRR (dPV/dz(Tk)) pour une liste de bonds.
+    """
     def prep_bond(tr: BondTrade, curve0: ZeroCurve) -> None:
+        # Pas de paramètre à figer comme K0 (contrairement au swap)
         return None
 
     def pv_bond_ctx(tr: BondTrade, curve: ZeroCurve, _: None) -> float:
         return pv_bond(curve, tr.notional, tr.coupon_rate, tr.maturity)
 
     def print_bond(tr: BondTrade, pv0_rep: float) -> None:
-        print(f"\n  Bond {tr.name} ({tr.ccy}) | maturity={tr.maturity}Y | PV0={pv0_rep:,.2f} {mkt.reporting_ccy}".replace(",", " "))
+        print(
+            f"\n  Bond {tr.name} ({tr.ccy}) | maturity={tr.maturity}Y | PV0={pv0_rep:,.2f} {mkt.reporting_ccy}"
+            .replace(",", " ")
+        )
 
     return bump_and_reprice_sens(
-        trades=trades, mkt=mkt, cfg=cfg,
-        prepare_ctx=prep_bond, pv_with_ctx=pv_bond_ctx, ccy_func=lambda t: t.ccy,
-        printer=print_bond, verbose=verbose
+        trades=trades,
+        mkt=mkt,
+        cfg=cfg,
+        prepare_ctx=prep_bond,
+        pv_with_ctx=pv_bond_ctx,
+        ccy_func=lambda t: t.ccy,
+        printer=print_bond,
+        verbose=verbose
     )
 
 
@@ -789,11 +1151,29 @@ from typing import Any, Dict, List, Optional
 
 
 def db_path() -> Path:
-    # DB à côté de app.py / ui_common.py
+    """
+    Renvoie le chemin du fichier SQLite utilisé pour historiser les runs.
+
+    Choix volontaire :
+    - DB locale, simple, sans dépendance externe (pas besoin de serveur).
+    - Placée à côté de app.py / ui_common.py pour rester "portable" (copier-coller du projet).
+    """
     return Path(__file__).resolve().parent / "frtb_history.sqlite3"
 
 
 def _connect() -> sqlite3.Connection:
+    """
+    Ouvre une connexion SQLite configurée pour l'usage Streamlit.
+
+    - check_same_thread=False :
+        Streamlit peut recharger/rerun le script et manipuler la DB depuis différents contextes.
+        Cela évite certaines erreurs "SQLite objects created in a thread...".
+        (On reste prudent : on ouvre/ferme vite les connexions.)
+
+    - row_factory=sqlite3.Row :
+        Permet de récupérer des lignes sous forme "dict-like" (accès par nom de colonne),
+        très pratique pour transformer ensuite en dict/JSON/DataFrame.
+    """
     p = db_path()
     con = sqlite3.connect(str(p), check_same_thread=False)
     con.row_factory = sqlite3.Row
@@ -801,8 +1181,12 @@ def _connect() -> sqlite3.Connection:
 
 
 def init_db() -> None:
+    """
+    Initialise le schéma de la base (idempotent).
+    """
     con = _connect()
     try:
+        # Création de la table si elle n'existe pas déjà
         con.execute(
             """
             CREATE TABLE IF NOT EXISTS runs (
@@ -823,14 +1207,21 @@ def init_db() -> None:
             );
             """
         )
+
+        # Index pour accélérer la navigation dans l'historique
         con.execute("CREATE INDEX IF NOT EXISTS idx_runs_created_at ON runs(created_at_utc);")
         con.execute("CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);")
+
         con.commit()
     finally:
+        # Toujours fermer la connexion, même en cas d'erreur
         con.close()
 
 
 def insert_run(rec: Dict[str, Any]) -> int:
+    """
+    Insère un run dans la table runs et renvoie l'id créé.
+    """
     init_db()
     con = _connect()
     try:
@@ -849,19 +1240,28 @@ def insert_run(rec: Dict[str, Any]) -> int:
             "meta_json",
             "error_txt",
         ]
+
         vals = [rec.get(c) for c in cols]
+
         q = f"INSERT INTO runs ({','.join(cols)}) VALUES ({','.join(['?']*len(cols))})"
         cur = con.execute(q, vals)
         con.commit()
+
         return int(cur.lastrowid)
     finally:
         con.close()
 
 
 def list_runs(limit: int = 200, status: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Liste les runs (vue "compacte") pour alimenter l'UI Historique.
+    - limit : nombre max de runs renvoyés
+    - status : None (tous) ou "ok" / "error" pour filtrer
+    """
     init_db()
     con = _connect()
     try:
+        # Filtre optionnel sur le statut
         if status in ("ok", "error"):
             cur = con.execute(
                 """
@@ -883,12 +1283,17 @@ def list_runs(limit: int = 200, status: Optional[str] = None) -> List[Dict[str, 
                 """,
                 (int(limit),),
             )
+
+        # sqlite3.Row -> dict pour faciliter pandas / json / streamlit
         return [dict(r) for r in cur.fetchall()]
     finally:
         con.close()
 
 
 def get_run(run_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Renvoie le détail complet d'un run (toutes les colonnes), ou None si introuvable.
+    """
     init_db()
     con = _connect()
     try:
@@ -900,6 +1305,9 @@ def get_run(run_id: int) -> Optional[Dict[str, Any]]:
 
 
 def delete_run(run_id: int) -> None:
+    """
+    Supprime un run spécifique (par id).
+    """
     init_db()
     con = _connect()
     try:
@@ -910,6 +1318,9 @@ def delete_run(run_id: int) -> None:
 
 
 def clear_all() -> None:
+    """
+    Supprime tout l'historique (tous les runs).
+    """
     init_db()
     con = _connect()
     try:
@@ -975,16 +1386,35 @@ from curves import ZeroCurve
 
 @dataclass(frozen=True)
 class Market:
+    """
+    Snapshot de marché pour le moteur FRTB.
+
+    Contient :
+    - reporting_ccy : devise de reporting (ex: "EUR") 
+    - fx           : table FX (from_ccy, to_ccy) -> taux de change
+                    ex: {("USD","EUR"): 0.92, ("EUR","USD"): 1/0.92}
+    - curves       : courbes de taux par devise
+                    ex: {"EUR": ZeroCurve(...), "USD": ZeroCurve(...)}
+
+    """
     reporting_ccy: str
-    fx: Dict[Tuple[str, str], float]     # (from,to) -> rate
-    curves: Dict[str, ZeroCurve]         # ccy -> curve
+    fx: Dict[Tuple[str, str], float]     
+    curves: Dict[str, ZeroCurve]         
 
     def convert(self, amount: float, from_ccy: str, to_ccy: str) -> float:
+        """
+        Convertit un montant d'une devise vers une autre à l'aide de la table FX.
+        """
+        # Pas de conversion si même devise
         if from_ccy == to_ccy:
             return amount
+
+        # On cherche le taux FX direct
         key = (from_ccy, to_ccy)
         if key not in self.fx:
             raise ValueError(f"FX manquant pour {from_ccy}->{to_ccy}")
+
+        # Conversion simple : amount * FX(from->to)
         return amount * self.fx[key]
 
 
@@ -999,6 +1429,20 @@ from typing import List
 
 @dataclass
 class EquityCallTrade:
+    """
+    Trade Equity (option call européenne) utilisé dans la risk class Equity (SA/SBM).
+
+    Champs :
+    - name   : identifiant lisible du trade
+    - bucket : bucket réglementaire Equity (nombre entier)
+    - N      : quantité / notionnel 
+    - S0     : spot initial
+    - K      : strike
+    - T      : maturité (en années)
+    - r      : taux sans risque (pour le discounting)
+    - q_repo : coût de portage / repo (dividend yield)
+    - sigma  : volatilité (Black-Scholes)
+    """
     name: str
     bucket: int
     N: float
@@ -1012,15 +1456,35 @@ class EquityCallTrade:
 
 @dataclass
 class SwapTrade:
+    """
+    Trade GIRR de type swap vanilla (IRS) utilisé pour la partie GIRR Delta (SBM).
+
+    - name         : identifiant du trade
+    - ccy          : devise du swap 
+    - notional     : notionnel du swap
+    - maturity     : maturité (en années)
+    - receive_fixed: sens du swap
+        True  -> Receive-Fixed (on reçoit le fixe / paye le float)
+        False -> Pay-Fixed     (on paye le fixe / reçoit le float)
+    """
     name: str
     ccy: str
     notional: float
     maturity: int
-    receive_fixed: bool  # True Receive-Fixed, False Pay-Fixed
+    receive_fixed: bool  
 
 
 @dataclass
 class BondTrade:
+    """
+    Trade GIRR de type bond à cashflows simples (coupon fixe annuel + remboursement in fine).
+
+    - name        : identifiant du bond
+    - ccy         : devise du bond (bucket GIRR)
+    - notional    : nominal
+    - coupon_rate : coupon annuel (taux, ex: 0.03)
+    - maturity    : maturité (en années, entier ici)
+    """
     name: str
     ccy: str
     notional: float
@@ -1030,48 +1494,86 @@ class BondTrade:
 
 @dataclass
 class Portfolio:
+    """
+    Portfolio "multi risk class" pour le moteur de démo.
+
+    On sépare explicitement les listes par typologie :
+    - equity_calls : trades Equity (options)
+    - girr_swaps   : trades GIRR (swaps)
+    - girr_bonds   : trades GIRR (bonds)
+
+    """
     equity_calls: List[EquityCallTrade]
     girr_swaps: List[SwapTrade]
     girr_bonds: List[BondTrade]
 
 
 def load_portfolio_csv(path: str) -> Portfolio:
+    """
+    Charge un portfolio depuis un CSV (une ligne = un trade).
+
+    Format attendu (colonne "type") :
+    - EQUITY_CALL
+    - GIRR_SWAP
+    - GIRR_BOND
+    """
+    # Listes de trades par sous-portfolio
     eq: List[EquityCallTrade] = []
     sw: List[SwapTrade] = []
     bo: List[BondTrade] = []
 
+    # Lecture CSV avec DictReader (header -> dictionnaire par ligne)
     with open(path, "r", newline="", encoding="utf-8") as f:
         r = csv.DictReader(f)
+
         for row in r:
             t = (row.get("type") or "").strip().upper()
+
+            # -----------------------------
+            # EQUITY_CALL
+            # -----------------------------
             if t == "EQUITY_CALL":
-                eq.append(EquityCallTrade(
-                    name=row["name"],
-                    bucket=int(row["bucket"]),
-                    N=float(row["N"]),
-                    S0=float(row["S0"]),
-                    K=float(row["K"]),
-                    T=float(row["T"]),
-                    r=float(row["r"]),
-                    q_repo=float(row["q_repo"]),
-                    sigma=float(row["sigma"]),
-                ))
+                eq.append(
+                    EquityCallTrade(
+                        name=row["name"],
+                        bucket=int(row["bucket"]),
+                        N=float(row["N"]),
+                        S0=float(row["S0"]),
+                        K=float(row["K"]),
+                        T=float(row["T"]),
+                        r=float(row["r"]),
+                        q_repo=float(row["q_repo"]),
+                        sigma=float(row["sigma"]),
+                    )
+                )
+
+            # -----------------------------
+            # GIRR_SWAP
+            # -----------------------------
             elif t == "GIRR_SWAP":
-                sw.append(SwapTrade(
-                    name=row["name"],
-                    ccy=row["ccy"].strip().upper(),
-                    notional=float(row["notional"]),
-                    maturity=int(row["maturity"]),
-                    receive_fixed=bool(int(row["receive_fixed"])),
-                ))
+                sw.append(
+                    SwapTrade(
+                        name=row["name"],
+                        ccy=row["ccy"].strip().upper(),
+                        notional=float(row["notional"]),
+                        maturity=int(row["maturity"]),
+                        receive_fixed=bool(int(row["receive_fixed"])),
+                    )
+                )
+
+            # -----------------------------
+            # GIRR_BOND
+            # -----------------------------
             elif t == "GIRR_BOND":
-                bo.append(BondTrade(
-                    name=row["name"],
-                    ccy=row["ccy"].strip().upper(),
-                    notional=float(row["notional"]),
-                    coupon_rate=float(row["coupon_rate"]),
-                    maturity=int(row["maturity"]),
-                ))
+                bo.append(
+                    BondTrade(
+                        name=row["name"],
+                        ccy=row["ccy"].strip().upper(),
+                        notional=float(row["notional"]),
+                        coupon_rate=float(row["coupon_rate"]),
+                        maturity=int(row["maturity"]),
+                    )
+                )
             elif not t:
                 continue
             else:
