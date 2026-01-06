@@ -16,8 +16,8 @@ st.markdown("### 🏦 Contexte - Aggrégation reporting FRTB")
 
 st.info(
     """
-Lors de mon stage de fin d’études chez **Banque Palatine** (équipe **Risque de Marché & Risque de Contrepartie**),
-j’ai travaillé sur la **consolidation / agrégation de reportings FRTB** du département Risques Financiers.
+Lors de mon stage de fin d’études chez **Banque Palatine** (Département RISF),
+j’ai travaillé sur la **consolidation / agrégation de reportings FRTB**.
 
 Dans ce contexte, les calculs étaient réalisés via une **librairie Python** produisant des sorties structurées,
 et l’enjeu côté reporting consistait à **standardiser les inputs/outputs**, **assembler** l’information et la
