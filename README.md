@@ -8,9 +8,8 @@ Dashboard Streamlit multi-pages qui expose un **mini moteur FRTB SA / SBM** :
 - **Historique** : runs persistés en **SQLite** (snapshot + KPIs + outputs)
 
 > ⚠️ Projet à but illustratif : paramètres, mappings et market “demo” ne sont pas une implémentation complète du texte réglementaire.
-> 
-👉 Démo en ligne : **https://boudarene-moteurfrtb.streamlit.app/**
 
+👉 Démo en ligne : **https://boudarene-moteurfrtb.streamlit.app/**
 ---
 
 ## 1) Prérequis
