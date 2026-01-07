@@ -54,7 +54,7 @@ with cD:
 
 st.success(
     """
-✅ **En résumé** : les données sont **synthétiques** et le périmètre est **pédagogique** (Equity + GIRR),
+**En résumé** : les données sont **synthétiques** et le périmètre est **pédagogique** (Equity + GIRR),
 mais l’application illustre concrètement ce que j’ai fait en stage :
 **structurer** les entrées/sorties d’un moteur, **consolider** un reporting, et assurer la **reproductibilité**.
 """,
