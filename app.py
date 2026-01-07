@@ -61,19 +61,6 @@ mais l’application illustre concrètement ce que j’ai fait en stage :
     icon="✅",
 )
 
-with st.expander("🔎 Comment je m’y suis pris (approche “industrie du reporting”)", expanded=False):
-    st.markdown(
-        """
-- **Contrat de données** : définition d’un format pivot pour le portfolio (CSV) et d’un snapshot marché (courbes/FX).  
-- **Séparation calcul / restitution** : le moteur renvoie des résultats structurés ; l’UI se charge de la mise en forme.  
-- **Explicabilité** : affichage étape-par-étape (WS, Kb, totaux par scénario), matrices de corrélation et graphiques.  
-- **Audit trail** : capture des logs + historisation SQLite des runs (statut, KPIs, snapshots, exports) pour rejouer/comparer.
-"""
-    )
-
-st.divider()
-
-
 
 if st.session_state.get("last_logs"):
     with st.expander("Afficher les logs du dernier run", expanded=False):
